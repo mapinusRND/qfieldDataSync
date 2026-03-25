@@ -1,0 +1,7 @@
+qfieldcloud-sdk
+geopandas
+sqlalchemy
+geoalchemy2
+psycopg2-binary
+fiona
+pyproj
