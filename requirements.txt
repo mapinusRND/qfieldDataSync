@@ -6,3 +6,10 @@ psycopg2-binary
 fiona
 pyproj
 pytz
+AudioSegment
+
+# 자연어 처리 및 오디오
+customized_konlpy==0.0.64
+kss==4.5.1
+speechrecognition==3.9.0
+pydub==0.25.1
