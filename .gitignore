@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
+qfield
 
 # 가상환경 폴더 무시
 .venv/
