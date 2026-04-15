@@ -40,7 +40,14 @@ DB_PASS = "1q2w3e4r"
 DB_URL = f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
 # 기타 경로 및 간격 설정
-BASE_OUTPUT_DIR = "./qfield"    # 프로젝트 파일이 다운로드될 로컬 경로
+# ========== 기타 경로 및 환경 설정 ==========
+# 환경 변수에 따라 로컬(D드라이브) 또는 도커 내부(/app/webfiles) 경로 자동 선택
+ENV = os.getenv('FLASK_ENV', 'local')
+if ENV == 'local':
+    BASE_OUTPUT_DIR = "D:/work/qfield"
+else:
+    BASE_OUTPUT_DIR = "/app/webfiles/qfield"
+
 TARGET_SCHEMA = "qfield"        # 215 DB 내에서 데이터를 관리할 스키마 명칭
 CHECK_INTERVAL = 30             # 동기화 루프 주기 (초)
 
@@ -49,6 +56,11 @@ CHECK_INTERVAL = 30             # 동기화 루프 주기 (초)
 QFIELD_INFO_SCHEMA = "disaster"
 QFIELD_INFO_TABLE = "qfield_info"
 # ============================================
+
+# 디렉토리가 없으면 생성
+if not os.path.exists(BASE_OUTPUT_DIR):
+    os.makedirs(BASE_OUTPUT_DIR, exist_ok=True)
+    print(f"📂 [경로 생성] {BASE_OUTPUT_DIR}")
 
 # ---------- SDK 및 DB 연결 관련 함수 ----------
 
