@@ -396,49 +396,11 @@ def _terminate_schema_idle_blockers(schema=TARGET_SCHEMA, label=""):
                 print(f"      ℹ️ 종료할 블로킹 커넥션 없음 ({label or schema})")
         conn.close()
         if terminated:
-            time.sleep(2)  # 종료 신호 OS 반영 대기
-            # 강제 종료된 커넥션이 db_engine 풀에 있을 수 있으므로 풀 전체 재생성
-            try:
-                db_engine.dispose()
-            except Exception:
-                pass
+            time.sleep(1)
         return len(terminated)
     except Exception as e:
         print(f"      ⚠️ 블로킹 커넥션 종료 실패 (권한 부족?): {e}")
         return 0
-
-
-def _drop_table_with_retry(schema, table_name, max_retries=3, retry_delay=3):
-    """
-    테이블 DROP을 autocommit + 재시도로 실행.
-    - lock_timeout=5초로 빠르게 실패 감지
-    - 실패 시 스키마 내 idle 커넥션 종료 후 재시도
-    """
-    for attempt in range(1, max_retries + 1):
-        try:
-            conn = psycopg2.connect(
-                host=DB_HOST, port=DB_PORT,
-                dbname=DB_NAME, user=DB_USER, password=DB_PASS,
-                connect_timeout=CONNECT_TIMEOUT_SEC,
-                options=f"-c lock_timeout=5000 -c statement_timeout={STATEMENT_TIMEOUT_MS}",
-            )
-            conn.autocommit = True
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(f'DROP TABLE IF EXISTS {schema}."{table_name}" CASCADE')
-                print(f"      🗑️ 테이블 삭제 완료: {table_name}")
-                return True
-            finally:
-                conn.close()
-        except psycopg2.errors.LockNotAvailable:
-            print(f"      🔁 테이블 DROP 락 충돌 ({attempt}/{max_retries}): {table_name}")
-            _terminate_schema_idle_blockers(schema, label=f"before drop {table_name}")
-            time.sleep(retry_delay)
-        except Exception as e:
-            print(f"      ⚠️ 테이블 DROP 오류 ({table_name}, 시도 {attempt}): {e}")
-            time.sleep(retry_delay)
-    print(f"      ❌ 테이블 DROP 최종 실패: {table_name}")
-    return False
 
 
 def _drop_create_view(view_name, view_sql, max_retries=3, retry_delay=3):
@@ -677,37 +639,19 @@ while True:
             id_placeholders = ', '.join([f"'{i}'" for i in current_ids])
             id_list_sql = f"({id_placeholders})"
             try:
-                # ① 유령 목록 조회 (전용 커넥션, 읽기 전용)
-                with get_pg_conn_safe() as rconn:
-                    with rconn.cursor() as rcur:
-                        rcur.execute(
-                            f"SELECT table_name, id FROM {TARGET_SCHEMA}.qfield_data_manage"
-                            f" WHERE id NOT IN {id_list_sql}"
-                        )
-                        ghosts = rcur.fetchall()
-
-                if ghosts:
-                    ghost_ids = set(g[1] for g in ghosts)
-
-                    # ② 테이블 DROP: autocommit 커넥션 + 재시도
-                    for g in ghosts:
-                        _drop_table_with_retry(TARGET_SCHEMA, g[0])
-
-                    # ③ 관리 테이블에서 행 삭제
-                    with get_pg_conn_safe() as dconn:
-                        with dconn.cursor() as dcur:
-                            for gid in ghost_ids:
-                                dcur.execute(
-                                    f"DELETE FROM {TARGET_SCHEMA}.qfield_data_manage WHERE id = %s",
-                                    (gid,)
-                                )
-                        dconn.commit()
-
-                    # ④ 캐시 정리 및 뷰 갱신
-                    for gid in ghost_ids:
-                        last_jobs_cache.pop(gid, None)
-                    update_unified_view()
-
+                with db_engine.begin() as conn:
+                    ghosts = conn.execute(
+                        text(f"SELECT table_name, id FROM {TARGET_SCHEMA}.qfield_data_manage WHERE id NOT IN {id_list_sql}")
+                    ).fetchall()
+                    if ghosts:
+                        for g in ghosts:
+                            conn.execute(text(f'DROP TABLE IF EXISTS {TARGET_SCHEMA}."{g[0]}" CASCADE'))
+                            conn.execute(text(f"DELETE FROM {TARGET_SCHEMA}.qfield_data_manage WHERE id = :pid"), {"pid": g[1]})
+                        # last_jobs_cache에서도 제거
+                        ghost_ids = set(g[1] for g in ghosts)
+                        for gid in ghost_ids:
+                            last_jobs_cache.pop(gid, None)
+                        update_unified_view()
             except Exception as e:
                 print(f"    ⚠️ 유령 프로젝트 정리 오류: {e}")
 
