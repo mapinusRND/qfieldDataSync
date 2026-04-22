@@ -219,10 +219,6 @@ def save_gdf_direct(gdf, table_name, schema, project_path, owner_name, allowed_c
             if 'record' in c.lower():
                 final_cols.append(c + '_txt')
 
-        # ── STEP 0: 스키마 내 idle 블로킹 커넥션 선제 종료 ──
-        # 뷰를 통해 참조 테이블에 락이 걸린 외부 커넥션(DBeaver 등)을 먼저 제거
-        _terminate_schema_idle_blockers(schema, label=f"before save {table_name}")
-
         # ── STEP 1: DROP / CREATE (autocommit으로 즉시 반영, 락 대기 최소화) ──
         col_defs = ['seq SERIAL PRIMARY KEY', 'platform_type SMALLINT DEFAULT 1']
         for col in final_cols:
@@ -355,63 +351,18 @@ def _build_view_sql_parts(q_type, table_rows):
     return view_parts
 
 
-def _terminate_schema_idle_blockers(schema=TARGET_SCHEMA, label=""):
-    """
-    특정 스키마의 테이블/뷰에 락을 잡고
-    'idle in transaction' 또는 'idle' 상태인 외부 커넥션을 강제 종료.
-
-    - DBeaver 등 클라이언트가 뷰를 통해 참조 테이블까지 락을 보유하는 경우 대응
-    - idle in transaction : 트랜잭션 열고 방치
-    - idle               : 쿼리 완료 후 커넥션 풀에서 락을 미반환하는 경우
-    - active 상태(실행 중인 쿼리)는 건드리지 않음
-    - pg_terminate_backend() 는 superuser 권한 필요
-    """
-    terminate_sql = """
-        SELECT sa.pid, sa.state, sa.application_name,
-               pg_terminate_backend(sa.pid) AS terminated
-        FROM pg_locks lk
-        JOIN pg_stat_activity sa ON lk.pid = sa.pid
-        JOIN pg_class pc ON lk.relation = pc.oid
-        JOIN pg_namespace pn ON pc.relnamespace = pn.oid
-        WHERE pn.nspname = %s
-          AND sa.state IN ('idle in transaction', 'idle')
-          AND sa.pid <> pg_backend_pid()
-        GROUP BY sa.pid, sa.state, sa.application_name
-    """
-    try:
-        conn = psycopg2.connect(
-            host=DB_HOST, port=DB_PORT,
-            dbname=DB_NAME, user=DB_USER, password=DB_PASS,
-            connect_timeout=CONNECT_TIMEOUT_SEC,
-        )
-        conn.autocommit = True
-        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-            cur.execute(terminate_sql, (schema,))
-            rows = cur.fetchall()
-            terminated = [r for r in rows if r['terminated']]
-            if terminated:
-                for r in terminated:
-                    print(f"      🔌 커넥션 강제 종료 [{r['state']}] pid={r['pid']} app={r['application_name']} ({label})")
-            else:
-                print(f"      ℹ️ 종료할 블로킹 커넥션 없음 ({label or schema})")
-        conn.close()
-        if terminated:
-            time.sleep(1)
-        return len(terminated)
-    except Exception as e:
-        print(f"      ⚠️ 블로킹 커넥션 종료 실패 (권한 부족?): {e}")
-        return 0
-
-
-def _drop_create_view(view_name, view_sql, max_retries=3, retry_delay=3):
+def _drop_create_view(view_name, view_sql, max_retries=3, retry_delay=5):
     """
     DROP VIEW IF EXISTS → CREATE VIEW 순서로 실행.
-    락 충돌(lock_timeout) 발생 시:
-      → idle in transaction 상태의 블로킹 커넥션을 강제 종료 후 재시도
-      → 최대 max_retries 회까지 반복
+    - CREATE OR REPLACE VIEW 는 기존 뷰에 ExclusiveLock을 시도하므로
+      열린 커서/트랜잭션이 있으면 lock_timeout 오류가 발생.
+    - DROP → CREATE 분리 방식도 동일한 락이 필요하지만,
+      재시도 간격을 두어 외부 락이 해제될 때까지 대기.
+    - 각 시도는 독립 커넥션 + lock_timeout=5s 로 빠르게 실패/재시도.
     """
     for attempt in range(1, max_retries + 1):
         try:
+            # 뷰 DDL 전용: lock_timeout을 짧게(5초) 설정해 빠른 재시도 유도
             conn = psycopg2.connect(
                 host=DB_HOST, port=DB_PORT,
                 dbname=DB_NAME, user=DB_USER, password=DB_PASS,
@@ -427,12 +378,10 @@ def _drop_create_view(view_name, view_sql, max_retries=3, retry_delay=3):
                 return True
             finally:
                 conn.close()
-
         except psycopg2.errors.LockNotAvailable:
-            print(f"      🔁 뷰 락 충돌 감지 ({attempt}/{max_retries}): {view_name}")
-            _terminate_schema_idle_blockers(label=view_name)  # idle 커넥션 강제 종료
+            # lock_timeout 초과 → 재시도
+            print(f"      🔁 뷰 락 대기 초과, {retry_delay}초 후 재시도 ({attempt}/{max_retries}): {view_name}")
             time.sleep(retry_delay)
-
         except Exception as e:
             print(f"      ⚠️ 뷰 생성 오류 ({view_name}, 시도 {attempt}): {e}")
             time.sleep(retry_delay)
@@ -469,9 +418,6 @@ def update_unified_view():
                     type_tables[q_type] = cur.fetchall()
 
         # ── STEP 2: 타입별로 뷰 SQL 조립 후 DDL 실행 ──
-        # 뷰 DDL 전 스키마 내 idle 커넥션 일괄 종료 (DBeaver 등 외부 클라이언트 대응)
-        _terminate_schema_idle_blockers(label="before view DDL")
-
         for q_type, table_rows in type_tables.items():
             view_name = f"{TARGET_SCHEMA}.{q_type}_v_qfield_data"
 
