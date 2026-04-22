@@ -205,6 +205,8 @@ def save_gdf_direct(gdf, table_name, schema, project_path, owner_name, allowed_c
     conn = None
     try:
         conn = get_pg_conn()
+        # [추가] 자동 커밋 모드 활성화 - 락 대기를 방지하고 즉시 반영합니다.
+        conn.autocommit = True
         cur = conn.cursor()
         is_geo = (isinstance(gdf, gpd.GeoDataFrame) and gdf.geometry is not None)
         geom_col = gdf.geometry.name if is_geo else None
@@ -246,6 +248,9 @@ def save_gdf_direct(gdf, table_name, schema, project_path, owner_name, allowed_c
         # 기존 테이블을 삭제하고 새로운 구조로 재생성 (스키마 유연성 확보)
         cur.execute(f'DROP TABLE IF EXISTS {schema}."{table_name}" CASCADE')
         cur.execute(f'CREATE TABLE {schema}."{table_name}" ({", ".join(col_defs)})')
+
+        # [중요] 루프 시작 전 다시 커밋 모드 조정 (대량 인서트를 위해)
+        conn.autocommit = False
 
         # 4. 데이터 삽입 루프 (행 단위 처리)
         for _, row in gdf.iterrows():
@@ -415,6 +420,8 @@ def update_unified_view():
     conn = None
     try:
         conn = get_pg_conn()
+        # [중요] 뷰 생성은 DDL이므로 자동 커밋 모드로 설정하여 락 대기를 방지합니다.
+        conn.autocommit = True
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
         
         # 현재 DB에 관리 중인 재난 타입(예: rain, fire) 종류 조회
@@ -527,14 +534,21 @@ def get_latest_job_id(project_id):
     try:
         if not client: client = login_client()
         jobs = client.list_jobs(project_id)
-        # delta_apply 타입 중 성공한 작업들만 필터링
-        delta_jobs = [j for j in jobs if j.get('type') == 'delta_apply' and j.get('status') == 'finished']
-        if not delta_jobs: return "NO_JOB"
-        # 생성 시간 순으로 정렬하여 가장 최근 것 선택
-        delta_jobs.sort(key=lambda j: j.get('created_at', ''), reverse=True)
-        return delta_jobs[0]['id']
-    except:
-        return "JOB_CHECK_ERROR"
+        
+        # 1. 현재 진행 중인(진행될) 작업이 있는지 확인
+        active_jobs = [j for j in jobs if j.get('type') == 'delta_apply' and j.get('status') in ['pending', 'running']]
+        if active_jobs:
+            # 작업이 아직 진행 중이면 'WAIT'를 반환하여 루프가 잠시 대기하게 함
+            return "JOB_IN_PROGRESS"
+
+        # 2. 완료된 최신 작업 확인
+        finished_jobs = [j for j in jobs if j.get('type') == 'delta_apply' and j.get('status') == 'finished']
+        if not finished_jobs: return "NO_JOB"
+        
+        finished_jobs.sort(key=lambda j: j.get('created_at', ''), reverse=True)
+        return finished_jobs[0]['id']
+    except Exception as e:
+        return f"ERROR_{str(e)}"
 
 
 def get_all_projects_from_db():
@@ -565,27 +579,24 @@ print(f"[{datetime.now()}] 🚀 실시간 동기화 엔진 가동 중...")
 
 while True:
     try:
-        # 1. 212 DB를 통해 현재 운영 중인 모든 프로젝트 목록 확보
         current_projects = get_all_projects_from_db()
         for p in current_projects:
             p_id = p['id']
             project_path = os.path.join(BASE_OUTPUT_DIR, p_id)
-            
-            # 2. 각 프로젝트별로 최신 성공 작업 ID 조회
             current_job_id = get_latest_job_id(p_id)
 
-            # 3. 변경 감지 조건:
-            # - 캐시에 정보가 없거나 (처음 실행)
-            # - 로컬에 파일이 없거나 (실수로 삭제된 경우)
-            # - 서버의 Job ID가 이전과 다를 때 (사용자가 기기에서 업로드 완료 시)
+            # [수정] 작업 중일 때는 다음 루프에서 확인하도록 건너뜀
+            if current_job_id == "JOB_IN_PROGRESS":
+                print(f"    ⏳ {p['name']}: 서버에서 변경사항 적용 중... 대기")
+                continue
+
+            # 변경 감지 조건
             if p_id not in last_jobs_cache or not os.path.exists(project_path) or current_job_id != last_jobs_cache[p_id]:
-                print(f"[{datetime.now()}] 🔄 변경 감지: {p['name']} (소유자: {p['owner']})")
-                
-                # 실질적인 동기화 및 DB 적재 수행
-                sync_single_project(p)
-                
-                # 처리 완료된 Job ID를 캐시에 저장하여 중복 실행 방지
-                last_jobs_cache[p_id] = current_job_id
+                # 에러 상태가 아닐 때만 실행
+                if "ERROR" not in current_job_id:
+                    print(f"[{datetime.now()}] 🔄 변경 감지: {p['name']} (Job: {current_job_id})")
+                    sync_single_project(p)
+                    last_jobs_cache[p_id] = current_job_id
 
     except Exception as e:
         print(f"⚠️ 루프 에러: {e}")
