@@ -311,17 +311,25 @@ def save_gdf_direct(gdf, table_name, schema, project_path, owner_name, allowed_c
 # ---------- GPKG 분석 및 워크플로우 제어 함수 ----------
 
 def process_gpkg_to_db(project_id, project_path, project_name, owner):
+    """
+    다운로드된 프로젝트 폴더 내의 모든 .gpkg 파일을 스캔하여 분석 및 적재를 수행합니다.
+    1. 관리 테이블(qfield_data_manage) 생성 및 프로젝트 변환 이력 관리.
+    2. GPKG 내의 각 레이어를 개별 데이터프레임으로 변환.
+    3. 좌표계를 3857로 통일하고 고유 테이블 명칭을 생성하여 save_gdf_direct 호출.
+    4. 분석 결과가 업데이트되면 최종 통합 뷰(VIEW)를 갱신하도록 트리거합니다.
+    """
     print(f"    🔍 [분석 시작] {project_name}")
-    short_id = project_id[:13]
+    short_id = project_id[:13] # 테이블 명칭 길이를 제한하기 위한 ID 슬라이싱
     now = datetime.now()
-    clean_owner = owner.lower().replace(' ', '_').replace('-', '_')
+    clean_owner = owner.lower().replace(' ', '_').replace('-', '_') # DB 명칭 규칙 준수용 치환
 
+    # 데이터 분류를 위한 기준 정보 로드
     qfield_info_map = get_qfield_info_column_lists()
     if not qfield_info_map:
         return False
 
-    # [수정] 관리 테이블 생성 시 즉시 커밋 및 연결 종료
-    with db_engine.begin() as conn:  # .begin()은 블록 종료 시 자동 커밋을 보장합니다.
+    # 어떤 프로젝트가 어떤 물리 테이블과 매칭되는지 기록하는 통합 관리 테이블
+    with db_engine.connect() as conn:
         conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS {TARGET_SCHEMA}.qfield_data_manage (
                 seq SERIAL PRIMARY KEY,
@@ -336,10 +344,12 @@ def process_gpkg_to_db(project_id, project_path, project_name, owner):
                 CONSTRAINT unique_gpkg_per_project UNIQUE (id, gpkg_name)
             )
         """))
+        conn.commit()
 
     any_updated, global_table_index = False, 1
     if not os.path.exists(project_path): return False
 
+    # 프로젝트 폴더 내의 모든 GeoPackage 파일 리스트 확보
     files = [f for f in os.listdir(project_path) if f.endswith(".gpkg")]
 
     for file in files:
@@ -350,34 +360,38 @@ def process_gpkg_to_db(project_id, project_path, project_name, owner):
             import fiona
             layers = fiona.listlayers(gpkg_path)
             for layer_name in layers:
+                # QGIS 내부 관리용 시스템 레이어는 데이터 분석에서 제외
                 if layer_name.lower() in ['layer_styles', 'geopackage_contents', 'gpkg_contents']:
                     continue
 
+                # 레이어 읽기 및 빈 데이터 체크
                 gdf = gpd.read_file(gpkg_path, layer=layer_name)
                 if gdf.empty: continue
 
+                # 지리 정보 유무 확인 및 컬럼 목록 추출
                 is_geo = (isinstance(gdf, gpd.GeoDataFrame) and gdf.geometry is not None)
                 geom_col = gdf.geometry.name if is_geo else None
                 gpkg_columns = [c for c in gdf.columns if c != geom_col]
 
+                # 해당 레이어가 우리가 관리하는 '재난 타입'에 해당하는지 판별
                 matched_type, matched_col_list = find_matching_qfield_type(gpkg_columns, qfield_info_map)
 
                 if matched_type is None:
+                    print(f"        ⏭️ [스킵] '{layer_name}' - 매칭 타입 없음")
                     continue
 
                 print(f"        ✅ [매칭 성공] type='{matched_type}'")
 
+                # 좌표계 통일: 원본 CRS가 있으면 3857로 변환, 없으면 기본값(5186) 부여 후 변환
                 gdf = gdf.to_crs(epsg=3857) if gdf.crs else gdf.set_crs(epsg=5186).to_crs(epsg=3857)
                 gdf = gdf.assign(owner=owner, reg_date=now, update_at=now)
 
+                # 개별 테이블명 생성 (소유자_ID_순번) 및 DB 전송
                 table_name = f"{clean_owner}_{short_id}_{global_table_index}"
-                
-                # [중요] 여기서 save_gdf_direct를 호출하기 전에 
-                # SQLAlchemy 엔진의 연결이 모두 반환(Commit)되었는지 확인해야 합니다.
                 save_gdf_direct(gdf, table_name, TARGET_SCHEMA, project_path, owner, allowed_columns=matched_col_list)
 
-                # [수정] 이력 기록 시에도 .begin()을 사용하여 작업 후 즉시 트랜잭션 종료
-                with db_engine.begin() as conn:
+                # 관리 테이블에 변환 이력 기록 (이미 있는 파일이면 최신 정보로 UPDATE)
+                with db_engine.connect() as conn:
                     conn.execute(text(f"""
                         INSERT INTO {TARGET_SCHEMA}.qfield_data_manage
                             (id, name, gpkg_name, table_name, owner, qfield_type, reg_date, update_at)
@@ -393,12 +407,14 @@ def process_gpkg_to_db(project_id, project_path, project_name, owner):
                         "pid": project_id, "pname": project_name, "gname": file_stem,
                         "tname": table_name, "owner": owner, "qtype": matched_type, "now": now
                     })
+                    conn.commit()
 
                 any_updated, global_table_index = True, global_table_index + 1
 
         except Exception as e:
             print(f"        ⚠️ {file} 처리 중 에러: {e}")
 
+    # 하나라도 데이터가 갱신되었다면 UNION ALL 기반의 대시보드용 뷰를 다시 생성합니다.
     if any_updated:
         update_unified_view()
 

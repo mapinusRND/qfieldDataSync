@@ -1,12 +1,16 @@
+# 환경 변수 관리 (추가)
+python-dotenv
+
+# QFieldCloud 및 데이터 처리
 qfieldcloud-sdk
 geopandas
+pandas
 sqlalchemy
 geoalchemy2
 psycopg2-binary
 fiona
 pyproj
 pytz
-AudioSegment
 
 # 자연어 처리 및 오디오
 customized_konlpy==0.0.64
