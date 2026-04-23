@@ -9,6 +9,7 @@ from sqlalchemy import create_engine, text
 from datetime import datetime
 from qfieldcloud_sdk import sdk
 from shapely.wkb import dumps as wkb_dumps
+from psycopg2.extras import execute_batch
 
 # ========== 외부 모듈 로드: Speech-To-Text (STT) ==========
 # 'disaster2convert' 모듈은 현장에서 녹음된 음성 파일을 텍스트로 변환하는 데 사용됩니다.
@@ -38,7 +39,7 @@ DB_NAME = "rnddb"
 DB_USER = "postgres"
 DB_PASS = "1q2w3e4r"
 DB_URL = f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-
+AUDIO_FILE_CACHE = {}
 # ========== 기타 경로 및 환경 설정 ==========
 # 실행 환경(로컬 vs 도커)에 따라 파일 저장 경로를 동적으로 설정합니다.
 # 로컬 개발 시에는 D 드라이브를, 도커 배포 시에는 /app 내부 경로를 사용합니다.
@@ -62,6 +63,12 @@ if not os.path.exists(BASE_OUTPUT_DIR):
     print(f"📂 [경로 생성] {BASE_OUTPUT_DIR}")
 
 # ---------- SDK 및 DB 연결 관련 함수 ----------
+def build_audio_cache(project_path):
+    cache = {}
+    for root, _, files in os.walk(project_path):
+        for f in files:
+            cache[f] = os.path.join(root, f)
+    return cache
 
 def login_client():
     """
@@ -192,115 +199,104 @@ def grant_admin_permission_via_db(project_id):
             conn.close()
 
 
+# ============================
+# 🔥 성능 개선된 핵심 함수
+# ============================
 def save_gdf_direct(gdf, table_name, schema, project_path, owner_name, allowed_columns=None):
-    """
-    정제된 GeoDataFrame을 215 DB에 실제 물리 테이블로 생성하고 데이터를 한 줄씩 INSERT 합니다.
-    주요 기능:
-    1. 테이블 생성: 매번 테이블을 DROP 후 새로 생성하여 스키마 변경에 대응(Overwrite).
-    2. STT 연동: 컬럼명에 'record'가 포함된 경우 해당 경로의 음성파일을 찾아 텍스트로 변환 후 '{명칭}_txt' 컬럼에 저장.
-    3. 좌표계: PostGIS 지오메트리를 WKB 포맷으로 변환하고 EPSG:3857(구글/웹메르카토르)로 고정하여 적재.
-    4. 메타데이터: 소유자(owner), 등록일(reg_date), 수정일(update_at)을 강제 포함.
-    """
     print(f"        💾 [DB 저장 시작] 테이블: {table_name}")
+
     conn = None
     try:
         conn = get_pg_conn()
         cur = conn.cursor()
-        is_geo = (isinstance(gdf, gpd.GeoDataFrame) and gdf.geometry is not None)
+
+        is_geo = isinstance(gdf, gpd.GeoDataFrame) and gdf.geometry is not None
         geom_col = gdf.geometry.name if is_geo else None
 
-        # 1. 컬럼 필터링 (불필요한 시스템 컬럼 제외 및 필수 컬럼 선정)
-        if allowed_columns is not None:
-            allowed_lower = [c.lower() for c in allowed_columns]
-            filtered_cols = [c for c in gdf.columns if c != geom_col and c.lower() in allowed_lower]
-            meta_cols = ['owner', 'reg_date', 'update_at']
-            for mc in meta_cols:
-                if mc in gdf.columns and mc not in filtered_cols:
-                    filtered_cols.append(mc)
-            source_cols = filtered_cols
+        # === 컬럼 필터 ===
+        if allowed_columns:
+            allowed_lower = set(c.lower() for c in allowed_columns)
+            source_cols = [c for c in gdf.columns if c != geom_col and c.lower() in allowed_lower]
         else:
             source_cols = [c for c in gdf.columns if c != geom_col]
 
-        # 2. 음성 결과물 저장을 위한 가상 컬럼(_txt) 구조 정의
+        # === STT 컬럼 추가 ===
         final_cols = []
         for c in source_cols:
             final_cols.append(c)
             if 'record' in c.lower():
                 final_cols.append(c + '_txt')
 
-        # 3. DB 컬럼 타입 정의 및 테이블 생성
+        # === 테이블 생성 ===
         col_defs = ['seq SERIAL PRIMARY KEY', 'platform_type SMALLINT DEFAULT 1']
         for col in final_cols:
-            if col.endswith('_txt') and 'record' in col.lower():
-                col_defs.append(f'"{col}" TEXT')
-            else:
-                dtype = str(gdf[col].dtype)
-                if 'int' in dtype: col_defs.append(f'"{col}" BIGINT')
-                elif 'float' in dtype: col_defs.append(f'"{col}" DOUBLE PRECISION')
-                elif 'datetime' in dtype: col_defs.append(f'"{col}" TIMESTAMP')
-                else: col_defs.append(f'"{col}" TEXT')
+            col_defs.append(f'"{col}" TEXT')
 
         if is_geo:
             col_defs.append(f'"{geom_col}" GEOMETRY(Geometry, 3857)')
 
-        # 기존 테이블을 삭제하고 새로운 구조로 재생성 (스키마 유연성 확보)
         cur.execute(f'DROP TABLE IF EXISTS {schema}."{table_name}" CASCADE')
         cur.execute(f'CREATE TABLE {schema}."{table_name}" ({", ".join(col_defs)})')
 
-        # 4. 데이터 삽입 루프 (행 단위 처리)
-        for _, row in gdf.iterrows():
-            cols, placeholders, values = ['platform_type'], ['%s'], [1]
-            for col in final_cols:
-                cols.append(f'"{col}"')
-                placeholders.append('%s')
+        # === 🔥 AUDIO 캐시 생성 (중요) ===
+        audio_cache = build_audio_cache(project_path)
 
-                # STT(음성 텍스트화) 처리 로직
-                if col.endswith('_txt') and 'record' in col.lower():
-                    origin_record_col = col[:-4]
-                    record_file = row.get(origin_record_col)
+        insert_cols = ['platform_type'] + final_cols
+        if is_geo:
+            insert_cols.append(geom_col)
+
+        placeholders = ['%s'] * len(insert_cols)
+        if is_geo:
+            placeholders[-1] = '%s::geometry'
+
+        sql = f'''
+            INSERT INTO {schema}."{table_name}"
+            ({", ".join([f'"{c}"' for c in insert_cols])})
+            VALUES ({", ".join(placeholders)})
+        '''
+
+        # === 🔥 batch 데이터 생성 ===
+        batch_data = []
+
+        for row in gdf.itertuples(index=False):  # 🔥 iterrows 제거
+            row_dict = row._asdict()
+            values = [1]
+
+            for col in final_cols:
+                if col.endswith('_txt'):
+                    origin = col[:-4]
+                    file = row_dict.get(origin)
+
                     stt_val = ""
-                    if record_file and isinstance(record_file, str) and record_file.strip():
-                        audio_path = os.path.join(project_path, record_file)
-                        # GPKG 내 저장된 경로가 유효하지 않을 경우 하위 폴더 전체 재탐색
-                        if not os.path.exists(audio_path):
-                            filename = os.path.basename(record_file)
-                            for root, dirs, files in os.walk(project_path):
-                                if filename in files:
-                                    audio_path = os.path.join(root, filename)
-                                    break
-                        # 음성 파일이 실제 존재하고 모듈이 로드된 경우 텍스트 추출 수행
-                        if os.path.exists(audio_path) and dc:
+                    if isinstance(file, str) and file.strip():
+                        filename = os.path.basename(file)
+                        path = audio_cache.get(filename)
+
+                        if path and dc:
                             try:
-                                stt_val = dc.read_audio(audio_path)
-                                if stt_val: print(f"        🎤 [STT 성공] ({col}) 결과: '{stt_val}'")
-                            except Exception as e:
-                                print(f"        🎤 [STT 실패] ({col}) 에러: {e}")
+                                stt_val = dc.read_audio(path)
+                            except:
+                                pass
                     values.append(stt_val)
                 else:
-                    # 일반 속성 데이터 적재 (NaN 값은 None으로 변환하여 DB NULL 처리)
-                    val = row[col]
+                    val = row_dict.get(col)
                     values.append(None if pd.isna(val) else val)
 
-            # 지리 정보(Geometry)를 WKB(Hex) 포맷으로 변환하여 PostGIS에 삽입
             if is_geo:
-                cols.append(f'"{geom_col}"')
-                geom = row[geom_col]
-                if geom:
-                    values.append(wkb_dumps(geom, hex=True, srid=3857))
-                    placeholders.append('%s::geometry')
-                else:
-                    values.append(None)
-                    placeholders.append('%s')
+                geom = row_dict.get(geom_col)
+                values.append(wkb_dumps(geom, hex=True, srid=3857) if geom else None)
 
-            cur.execute(
-                f'INSERT INTO {schema}."{table_name}" ({", ".join(cols)}) VALUES ({", ".join(placeholders)})',
-                values
-            )
+            batch_data.append(values)
+
+        # === 🔥 핵심: batch insert ===
+        execute_batch(cur, sql, batch_data, page_size=1000)
 
         conn.commit()
         print(f"        ✅ [DB 저장 성공] {table_name}")
+
     except Exception as e:
-        if conn: conn.rollback()
+        if conn:
+            conn.rollback()
         print(f"        ❌ [DB 저장 실패] {e}")
     finally:
         if conn:
@@ -609,4 +605,5 @@ while True:
         client = login_client() # 치명적 에러 발생 시 세션 재로그인 시도
 
     # 과도한 API 호출 방지를 위해 지정된 주기(30초)만큼 대기
+    print(f"[{datetime.now()}] 💤 대기중... ({CHECK_INTERVAL}초)")
     time.sleep(CHECK_INTERVAL)
