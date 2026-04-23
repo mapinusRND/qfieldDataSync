@@ -9,7 +9,6 @@ from sqlalchemy import create_engine, text
 from datetime import datetime
 from qfieldcloud_sdk import sdk
 from shapely.wkb import dumps as wkb_dumps
-from contextlib import contextmanager
 
 # ========== 외부 모듈 로드: Speech-To-Text (STT) ==========
 # 'disaster2convert' 모듈은 현장에서 녹음된 음성 파일을 텍스트로 변환하는 데 사용됩니다.
@@ -57,12 +56,6 @@ CHECK_INTERVAL = 30              # 새로운 데이터(Job)가 있는지 체크�
 QFIELD_INFO_SCHEMA = "disaster"
 QFIELD_INFO_TABLE = "qfield_info"
 
-# 타임아웃 설정: DB 연결/쿼리/락 대기 시 무한정 hang 방지
-STATEMENT_TIMEOUT_MS = 60_000   # 개별 쿼리 최대 60초
-LOCK_TIMEOUT_MS      = 10_000   # 락 대기 최대 10초
-CONNECT_TIMEOUT_SEC  = 10       # TCP 연결 최대 10초
-BATCH_SIZE           = 200      # INSERT 배치 크기
-
 # 디렉토리 초기화: 데이터를 다운로드할 기본 경로가 없으면 생성합니다.
 if not os.path.exists(BASE_OUTPUT_DIR):
     os.makedirs(BASE_OUTPUT_DIR, exist_ok=True)
@@ -79,7 +72,6 @@ def login_client():
     try:
         new_client = sdk.Client(url=URL)
         new_client.login(username=USERNAME, password=PASSWORD)
-        print(f"    ✅ QFieldCloud 로그인 성공")
         return new_client
     except Exception as e:
         print(f"❌ QFieldCloud 로그인 실패: {e}")
@@ -90,67 +82,15 @@ client = login_client()
 
 # SQLAlchemy 엔진: 데이터베이스 연결 풀링을 통해 대량의 INSERT/UPDATE 작업 시 안정성을 확보합니다.
 # pool_pre_ping은 끊긴 연결을 자동으로 감지하여 재연결하는 역할을 합니다.
-# connect_args로 타임아웃을 설정하여 hang 방지합니다.
-_connect_args = {
-    "connect_timeout": CONNECT_TIMEOUT_SEC,
-    "options": f"-c statement_timeout={STATEMENT_TIMEOUT_MS} -c lock_timeout={LOCK_TIMEOUT_MS}",
-}
-db_engine = create_engine(
-    DB_URL,
-    pool_pre_ping=True,
-    pool_recycle=300,
-    pool_size=5,
-    max_overflow=10,
-    connect_args=_connect_args,
-)
-
-
-@contextmanager
-def get_pg_conn_safe(autocommit=False):
-    """
-    215 서버용 psycopg2 커넥션을 안전하게 관리합니다.
-    - connect_timeout: TCP 연결 hang 방지
-    - statement_timeout / lock_timeout: 쿼리/락 대기 hang 방지
-    - autocommit 옵션: DDL(DROP/CREATE) 전용 커넥션에 사용
-    - 예외 발생 시 자동 rollback 및 커넥션 close 보장
-    """
-    conn = psycopg2.connect(
-        host=DB_HOST, port=DB_PORT,
-        dbname=DB_NAME, user=DB_USER, password=DB_PASS,
-        connect_timeout=CONNECT_TIMEOUT_SEC,
-        options=f"-c statement_timeout={STATEMENT_TIMEOUT_MS} -c lock_timeout={LOCK_TIMEOUT_MS}",
-    )
-    conn.autocommit = autocommit
-    try:
-        yield conn
-    except Exception:
-        if not autocommit:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-        raise
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
+db_engine = create_engine(DB_URL, pool_pre_ping=True, pool_recycle=600)
 
 def get_pg_conn():
     """최종 데이터 적재 및 조회용(215 서버) psycopg2 커넥션 생성 (Raw SQL 처리용)"""
-    return psycopg2.connect(
-        host=DB_HOST, port=DB_PORT, dbname=DB_NAME, user=DB_USER, password=DB_PASS,
-        connect_timeout=CONNECT_TIMEOUT_SEC,
-        options=f"-c statement_timeout={STATEMENT_TIMEOUT_MS} -c lock_timeout={LOCK_TIMEOUT_MS}",
-    )
+    return psycopg2.connect(host=DB_HOST, port=DB_PORT, dbname=DB_NAME, user=DB_USER, password=DB_PASS)
 
 def get_qfc_db_conn():
     """운영 메타데이터 조회용(212 서버) psycopg2 커넥션 생성 (사용자 및 프로젝트 정보 확인용)"""
-    return psycopg2.connect(
-        host=QFC_DB_HOST, port=QFC_DB_PORT, dbname=QFC_DB_NAME, user=QFC_DB_USER, password=QFC_DB_PASS,
-        connect_timeout=CONNECT_TIMEOUT_SEC,
-    )
+    return psycopg2.connect(host=QFC_DB_HOST, port=QFC_DB_PORT, dbname=QFC_DB_NAME, user=QFC_DB_USER, password=QFC_DB_PASS)
 
 # 프로그램 시작 시 215 서버에 데이터 저장용 스키마(qfield)가 없다면 미리 생성합니다.
 with db_engine.begin() as conn:
@@ -252,70 +192,20 @@ def grant_admin_permission_via_db(project_id):
             conn.close()
 
 
-def _terminate_schema_idle_blockers(schema=TARGET_SCHEMA, label=""):
-    """
-    특정 스키마의 테이블/뷰에 락을 잡고 'idle in transaction' 또는 'idle' 상태인
-    외부 커넥션(DBeaver 등)을 강제 종료합니다.
-    - idle in transaction: 트랜잭션을 열고 방치한 상태
-    - idle: 쿼리 완료 후 커넥션 풀에서 락을 미반환하는 경우
-    - active 상태(실행 중인 쿼리)는 건드리지 않음
-    - pg_terminate_backend()는 superuser 권한 필요
-    """
-    terminate_sql = """
-        SELECT sa.pid, sa.state, sa.application_name,
-               pg_terminate_backend(sa.pid) AS terminated
-        FROM pg_locks lk
-        JOIN pg_stat_activity sa ON lk.pid = sa.pid
-        JOIN pg_class pc ON lk.relation = pc.oid
-        JOIN pg_namespace pn ON pc.relnamespace = pn.oid
-        WHERE pn.nspname = %s
-          AND sa.state IN ('idle in transaction', 'idle')
-          AND sa.pid <> pg_backend_pid()
-        GROUP BY sa.pid, sa.state, sa.application_name
-    """
-    try:
-        conn = psycopg2.connect(
-            host=DB_HOST, port=DB_PORT,
-            dbname=DB_NAME, user=DB_USER, password=DB_PASS,
-            connect_timeout=CONNECT_TIMEOUT_SEC,
-        )
-        conn.autocommit = True
-        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-            cur.execute(terminate_sql, (schema,))
-            rows = cur.fetchall()
-            terminated = [r for r in rows if r['terminated']]
-            if terminated:
-                for r in terminated:
-                    print(f"      🔌 커넥션 강제 종료 [{r['state']}] pid={r['pid']} app={r['application_name']} ({label})")
-            else:
-                print(f"      ℹ️ 종료할 블로킹 커넥션 없음 ({label or schema})")
-        conn.close()
-        if terminated:
-            time.sleep(2)  # 종료 신호 OS 반영 대기
-            # 강제 종료된 커넥션이 db_engine 풀에 있을 수 있으므로 풀 전체 재생성
-            try:
-                db_engine.dispose()
-            except Exception:
-                pass
-        return len(terminated)
-    except Exception as e:
-        print(f"      ⚠️ 블로킹 커넥션 종료 실패 (권한 부족?): {e}")
-        return 0
-
-
 def save_gdf_direct(gdf, table_name, schema, project_path, owner_name, allowed_columns=None):
     """
-    정제된 GeoDataFrame을 215 DB에 실제 물리 테이블로 생성하고 데이터를 배치로 INSERT 합니다.
+    정제된 GeoDataFrame을 215 DB에 실제 물리 테이블로 생성하고 데이터를 한 줄씩 INSERT 합니다.
     주요 기능:
     1. 테이블 생성: 매번 테이블을 DROP 후 새로 생성하여 스키마 변경에 대응(Overwrite).
     2. STT 연동: 컬럼명에 'record'가 포함된 경우 해당 경로의 음성파일을 찾아 텍스트로 변환 후 '{명칭}_txt' 컬럼에 저장.
     3. 좌표계: PostGIS 지오메트리를 WKB 포맷으로 변환하고 EPSG:3857(구글/웹메르카토르)로 고정하여 적재.
     4. 메타데이터: 소유자(owner), 등록일(reg_date), 수정일(update_at)을 강제 포함.
-    5. 배치 INSERT: BATCH_SIZE 단위로 트랜잭션을 분할하여 단일 장시간 트랜잭션으로 인한 락 경합 방지.
     """
     print(f"        💾 [DB 저장 시작] 테이블: {table_name}")
     conn = None
     try:
+        conn = get_pg_conn()
+        cur = conn.cursor()
         is_geo = (isinstance(gdf, gpd.GeoDataFrame) and gdf.geometry is not None)
         geom_col = gdf.geometry.name if is_geo else None
 
@@ -338,10 +228,7 @@ def save_gdf_direct(gdf, table_name, schema, project_path, owner_name, allowed_c
             if 'record' in c.lower():
                 final_cols.append(c + '_txt')
 
-        # 3. 외부 idle 커넥션 선제 종료 후 DDL 실행 (DBeaver 등의 락 충돌 방지)
-        _terminate_schema_idle_blockers(schema, label=f"before save {table_name}")
-
-        # 4. DB 컬럼 타입 정의 및 테이블 생성 (autocommit으로 즉시 반영, 락 경합 최소화)
+        # 3. DB 컬럼 타입 정의 및 테이블 생성
         col_defs = ['seq SERIAL PRIMARY KEY', 'platform_type SMALLINT DEFAULT 1']
         for col in final_cols:
             if col.endswith('_txt') and 'record' in col.lower():
@@ -357,20 +244,16 @@ def save_gdf_direct(gdf, table_name, schema, project_path, owner_name, allowed_c
             col_defs.append(f'"{geom_col}" GEOMETRY(Geometry, 3857)')
 
         # 기존 테이블을 삭제하고 새로운 구조로 재생성 (스키마 유연성 확보)
-        with get_pg_conn_safe(autocommit=True) as ddl_conn:
-            with ddl_conn.cursor() as cur:
-                cur.execute(f'DROP TABLE IF EXISTS {schema}."{table_name}" CASCADE')
-                cur.execute(f'CREATE TABLE {schema}."{table_name}" ({", ".join(col_defs)})')
+        cur.execute(f'DROP TABLE IF EXISTS {schema}."{table_name}" CASCADE')
+        cur.execute(f'CREATE TABLE {schema}."{table_name}" ({", ".join(col_defs)})')
 
-        # 5. 데이터 행 준비
-        rows_to_insert = []
-        insert_cols = ['platform_type'] + [f'"{c}"' for c in final_cols]
-        if is_geo:
-            insert_cols.append(f'"{geom_col}"')
-
+        # 4. 데이터 삽입 루프 (행 단위 처리)
         for _, row in gdf.iterrows():
-            values = [1]
+            cols, placeholders, values = ['platform_type'], ['%s'], [1]
             for col in final_cols:
+                cols.append(f'"{col}"')
+                placeholders.append('%s')
+
                 # STT(음성 텍스트화) 처리 로직
                 if col.endswith('_txt') and 'record' in col.lower():
                     origin_record_col = col[:-4]
@@ -400,32 +283,29 @@ def save_gdf_direct(gdf, table_name, schema, project_path, owner_name, allowed_c
 
             # 지리 정보(Geometry)를 WKB(Hex) 포맷으로 변환하여 PostGIS에 삽입
             if is_geo:
+                cols.append(f'"{geom_col}"')
                 geom = row[geom_col]
                 if geom:
                     values.append(wkb_dumps(geom, hex=True, srid=3857))
+                    placeholders.append('%s::geometry')
                 else:
                     values.append(None)
-            rows_to_insert.append(values)
+                    placeholders.append('%s')
 
-        # 6. 배치 INSERT (BATCH_SIZE 단위로 트랜잭션 분할하여 락 경합 방지)
-        placeholders = ', '.join(
-            ['%s::geometry' if (is_geo and i == len(insert_cols) - 1) else '%s'
-             for i in range(len(insert_cols))]
-        )
-        insert_sql = f'INSERT INTO {schema}."{table_name}" ({", ".join(insert_cols)}) VALUES ({placeholders})'
+            cur.execute(
+                f'INSERT INTO {schema}."{table_name}" ({", ".join(cols)}) VALUES ({", ".join(placeholders)})',
+                values
+            )
 
-        total = len(rows_to_insert)
-        for batch_start in range(0, total, BATCH_SIZE):
-            batch = rows_to_insert[batch_start:batch_start + BATCH_SIZE]
-            with get_pg_conn_safe() as conn:
-                with conn.cursor() as cur:
-                    psycopg2.extras.execute_batch(cur, insert_sql, batch, page_size=BATCH_SIZE)
-                conn.commit()
-            print(f"        ↳ 배치 INSERT {min(batch_start + BATCH_SIZE, total)}/{total}")
-
+        conn.commit()
         print(f"        ✅ [DB 저장 성공] {table_name}")
     except Exception as e:
+        if conn: conn.rollback()
         print(f"        ❌ [DB 저장 실패] {e}")
+    finally:
+        if conn:
+            cur.close()
+            conn.close()
 
 
 # ---------- GPKG 분석 및 워크플로우 제어 함수 ----------
@@ -541,356 +421,114 @@ def process_gpkg_to_db(project_id, project_path, project_name, owner):
     return any_updated
 
 
-def _cleanup_deleted_project(project_id, project_name=""):
-    """
-    212 서버에서 삭제된 프로젝트를 215 DB와 로컬 파일시스템에서 정리합니다.
-    1. qfield_data_manage에서 해당 프로젝트의 행 조회
-    2. 참조된 물리 테이블을 DROP (락 충돌 시 재시도)
-    3. qfield_data_manage에서 해당 행 삭제
-    4. 로컬 다운로드 디렉토리 삭제
-    """
-    label = project_name or project_id[:8]
-    print(f"      🧹 [삭제 프로젝트 정리 시작] {label}")
-    try:
-        # ① 해당 프로젝트가 참조하는 물리 테이블 목록 조회
-        with get_pg_conn_safe() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"SELECT table_name FROM {TARGET_SCHEMA}.qfield_data_manage WHERE id = %s",
-                    (project_id,)
-                )
-                table_names = [row[0] for row in cur.fetchall()]
-
-        # ② 물리 테이블 DROP (autocommit + 재시도)
-        for t_name in table_names:
-            for attempt in range(1, 4):
-                try:
-                    conn_ddl = psycopg2.connect(
-                        host=DB_HOST, port=DB_PORT,
-                        dbname=DB_NAME, user=DB_USER, password=DB_PASS,
-                        connect_timeout=CONNECT_TIMEOUT_SEC,
-                        options=f"-c lock_timeout=5000 -c statement_timeout={STATEMENT_TIMEOUT_MS}",
-                    )
-                    conn_ddl.autocommit = True
-                    with conn_ddl.cursor() as cur:
-                        cur.execute(f'DROP TABLE IF EXISTS {TARGET_SCHEMA}."{t_name}" CASCADE')
-                    conn_ddl.close()
-                    print(f"      🗑️ 테이블 삭제: {t_name}")
-                    break
-                except psycopg2.errors.LockNotAvailable:
-                    print(f"      🔁 테이블 DROP 락 충돌 ({attempt}/3): {t_name}")
-                    _terminate_schema_idle_blockers(TARGET_SCHEMA, label=f"drop {t_name}")
-                    time.sleep(3)
-                except Exception as te:
-                    print(f"      ⚠️ 테이블 DROP 오류 ({t_name}): {te}")
-                    break
-
-        # ③ qfield_data_manage에서 해당 프로젝트 행 삭제
-        with get_pg_conn_safe() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"DELETE FROM {TARGET_SCHEMA}.qfield_data_manage WHERE id = %s",
-                    (project_id,)
-                )
-            conn.commit()
-        print(f"      ✅ qfield_data_manage 행 삭제 완료: {label}")
-
-        # ④ 로컬 다운로드 디렉토리 삭제
-        project_path = os.path.join(BASE_OUTPUT_DIR, project_id)
-        if os.path.exists(project_path):
-            shutil.rmtree(project_path, ignore_errors=True)
-            print(f"      🗂️ 로컬 파일 삭제: {project_path}")
-
-    except Exception as e:
-        print(f"      ❌ 삭제 프로젝트 정리 실패 ({label}): {e}")
-
-
-def _get_active_project_ids():
-    """
-    212 운영 DB에서 현재 실제로 존재하는 프로젝트 ID 목록을 조회합니다.
-    뷰 생성 시 use_yn 컬럼 값을 결정하는 데 사용됩니다.
-    - 현재도 서버에 존재하는 프로젝트 → use_yn = 'y'
-    - 서버에서 삭제된 프로젝트   → use_yn = 'n'
-    UUID 타입 차이(하이픈 유무, 대소문자)로 인한 비교 오류를 방지하기 위해
-    소문자 + 하이픈 포함 형식으로 정규화하여 저장합니다.
-    """
-    active_ids = set()
-    conn = None
-    try:
-        conn = get_qfc_db_conn()
-        cur = conn.cursor()
-        # UUID를 TEXT로 캐스팅하여 하이픈 포함 소문자 형식으로 통일
-        cur.execute("SELECT id::text FROM public.core_project")
-        for row in cur.fetchall():
-            normalized = str(row[0]).strip().lower()
-            active_ids.add(normalized)
-        print(f"      📋 활성 프로젝트 ID {len(active_ids)}개 조회 완료")
-        # 디버그: 처음 3개 샘플 출력 (형식 확인용)
-        for sample in list(active_ids)[:3]:
-            print(f"         샘플 ID: '{sample}'")
-    except Exception as e:
-        print(f"      ⚠️ 활성 프로젝트 ID 조회 실패: {e}")
-    finally:
-        if conn:
-            conn.close()
-    return active_ids
-
-
-def _drop_create_view(view_name, view_sql, max_retries=3, retry_delay=3):
-    """
-    DROP VIEW IF EXISTS → CREATE VIEW 순서로 DDL을 실행합니다.
-    락 충돌(lock_timeout) 발생 시:
-      → idle in transaction 상태의 블로킹 커넥션을 강제 종료 후 재시도
-      → 최대 max_retries 회까지 반복
-    """
-    for attempt in range(1, max_retries + 1):
-        try:
-            conn = psycopg2.connect(
-                host=DB_HOST, port=DB_PORT,
-                dbname=DB_NAME, user=DB_USER, password=DB_PASS,
-                connect_timeout=CONNECT_TIMEOUT_SEC,
-                options=f"-c lock_timeout=5000 -c statement_timeout={STATEMENT_TIMEOUT_MS}",
-            )
-            conn.autocommit = True
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(f"DROP VIEW IF EXISTS {view_name} CASCADE")
-                    cur.execute(view_sql)
-                print(f"      ✅ 뷰 생성 완료: {view_name}")
-                return True
-            finally:
-                conn.close()
-        except psycopg2.errors.LockNotAvailable:
-            print(f"      🔁 뷰 락 충돌 감지 ({attempt}/{max_retries}): {view_name}")
-            _terminate_schema_idle_blockers(label=view_name)
-            time.sleep(retry_delay)
-        except Exception as e:
-            print(f"      ⚠️ 뷰 생성 오류 ({view_name}, 시도 {attempt}): {e}")
-            time.sleep(retry_delay)
-    print(f"      ❌ 뷰 생성 최종 실패 (재시도 {max_retries}회 소진): {view_name}")
-    return False
-
-
 def update_unified_view():
     """
     분산되어 적재된 여러 사용자의 개별 테이블들을 '재난 타입별'로 하나로 묶어줍니다.
     dashboard나 GIS 클라이언트에서 조회하기 편하도록 'rain_v_qfield_data' 같은 이름의 VIEW를 생성합니다.
     동일한 컬럼 구조를 가진 테이블들을 'UNION ALL'로 결합하는 SQL을 동적으로 생성하여 실행합니다.
-
-    [use_yn 컬럼]
-    - 뷰의 owner 컬럼 앞에 use_yn(CHAR(1)) 컬럼을 배치합니다.
-    - 현재 212 서버에 존재하는 프로젝트(manage_id) → 'y'
-    - 212 서버에서 삭제된 프로젝트(manage_id)      → 'n'
-    - 이를 통해 클라이언트에서 유효한 데이터와 삭제된 데이터를 구분할 수 있습니다.
-
-    [UNION ALL 컬럼 정합성]
-    - UNION ALL은 모든 SELECT의 컬럼 수/타입이 동일해야 합니다.
-    - 같은 qfield_type에 속하는 테이블들의 '공통 컬럼 교집합'만 사용하여 안전하게 결합합니다.
-    - 공통 컬럼은 첫 번째 테이블의 ordinal_position 순서를 기준으로 정렬합니다.
     """
     print(f"    📊 [개별 뷰 갱신 시작]")
+    conn = None
     try:
-        # ── STEP 1: 메타데이터 조회 (일반 커넥션, 락 없음) ──
-        # 212 서버에서 현재 활성 상태인 프로젝트 ID 목록 조회 (use_yn 값 결정에 사용)
-        active_project_ids = _get_active_project_ids()
+        conn = get_pg_conn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        
+        # 현재 DB에 관리 중인 재난 타입(예: rain, fire) 종류 조회
+        cur.execute(f"SELECT DISTINCT qfield_type FROM {TARGET_SCHEMA}.qfield_data_manage WHERE qfield_type IS NOT NULL")
+        types = [r['qfield_type'] for r in cur.fetchall()]
 
-        type_rows_map = {}   # {q_type: [row, ...]}
-        table_cols_map = {}  # {table_name: [col_name, ...]}
+        if not types: return
 
-        with get_pg_conn_safe() as conn:
-            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-                # 현재 DB에 관리 중인 재난 타입(예: rain, fire) 종류 조회
-                cur.execute(
-                    f"SELECT DISTINCT qfield_type FROM {TARGET_SCHEMA}.qfield_data_manage"
-                    f" WHERE qfield_type IS NOT NULL"
-                )
-                types = [r['qfield_type'] for r in cur.fetchall()]
-
-                if not types:
-                    print(f"      ℹ️ 관리 중인 타입 없음, 뷰 갱신 스킵")
-                    return
-
-                for q_type in types:
-                    # 해당 타입에 속하는 모든 물리 테이블 리스트 조회
-                    cur.execute(
-                        f"SELECT id, name, gpkg_name, table_name"
-                        f" FROM {TARGET_SCHEMA}.qfield_data_manage WHERE qfield_type = %s",
-                        (q_type,)
-                    )
-                    type_rows_map[q_type] = cur.fetchall()
-
-                # 각 테이블의 컬럼 목록 조회 (information_schema는 락을 유발하지 않음)
-                all_table_names = [r['table_name'] for rows in type_rows_map.values() for r in rows]
-                for t_name in all_table_names:
-                    cur.execute(
-                        f"SELECT EXISTS (SELECT 1 FROM information_schema.tables"
-                        f" WHERE table_schema = '{TARGET_SCHEMA}' AND table_name = %s)",
-                        (t_name,)
-                    )
-                    if not cur.fetchone()[0]:
-                        # 물리 테이블이 없는 경우 빈 리스트로 표시
-                        table_cols_map[t_name] = []
-                        continue
-                    cur.execute(
-                        f"SELECT column_name FROM information_schema.columns"
-                        f" WHERE table_schema = '{TARGET_SCHEMA}' AND table_name = %s"
-                        f"   AND column_name != 'seq'"
-                        f" ORDER BY ordinal_position",
-                        (t_name,)
-                    )
-                    table_cols_map[t_name] = [row[0] for row in cur.fetchall()]
-
-        # ── STEP 2: 타입별 공통 컬럼 교집합 계산 후 뷰 SQL 조립 ──
-        # _terminate 후 db_engine.dispose()가 호출될 수 있으므로
-        # DDL 전에 미리 모든 메타데이터를 수집한 뒤 커넥션을 닫고 진행합니다.
-        _terminate_schema_idle_blockers(label="before view DDL")
-
-        for q_type, rows in type_rows_map.items():
-            # 물리 테이블이 실제로 존재하는 행만 필터링
-            valid_rows = [r for r in rows if table_cols_map.get(r['table_name'])]
-            if not valid_rows:
-                print(f"      ℹ️ 뷰 생성 스킵 (유효 테이블 없음): {q_type}_v_qfield_data")
-                continue
-
-            # 모든 유효 테이블의 컬럼 교집합 계산
-            # → UNION ALL 시 컬럼 수 불일치로 인한 SQL 오류 방지
-            col_sets = [set(table_cols_map[r['table_name']]) for r in valid_rows]
-            common_cols_set = col_sets[0]
-            for cs in col_sets[1:]:
-                common_cols_set = common_cols_set & cs
-
-            # 첫 번째 테이블의 ordinal_position 순서로 공통 컬럼 정렬
-            first_table_cols = table_cols_map[valid_rows[0]['table_name']]
-            # seq는 이미 제외됨, platform_type 등 공통 컬럼 순서 유지
-            ordered_common_cols = [c for c in first_table_cols if c in common_cols_set]
-
-            if not ordered_common_cols:
-                print(f"      ⚠️ 뷰 생성 스킵 (공통 컬럼 없음): {q_type}_v_qfield_data")
-                continue
-
-            # owner 컬럼 앞에 use_yn을 삽입할 위치 결정
-            # UNION ALL 전체에 동일한 컬럼 구조를 적용해야 하므로
-            # 고정 컬럼(manage_id, project_name 등) + use_yn + 공통 데이터 컬럼 순으로 구성
-            owner_idx = next(
-                (i for i, c in enumerate(ordered_common_cols) if c.lower() == 'owner'),
-                None  # owner 컬럼이 없는 경우
-            )
-
+        for q_type in types:
+            # 해당 타입에 속하는 모든 물리 테이블 리스트 조회
+            cur.execute(f"SELECT id, name, gpkg_name, table_name FROM {TARGET_SCHEMA}.qfield_data_manage WHERE qfield_type = %s", (q_type,))
+            rows = cur.fetchall()
+            
             view_parts = []
-            for r in valid_rows:
-                t_name   = r['table_name']
-                manage_id = str(r['id']).strip().lower()
-
-                # use_yn: 212 서버에 프로젝트가 존재하면 'y', 삭제됐으면 'n'
-                use_yn_val = 'y' if manage_id in active_project_ids else 'n'
-                # 디버그: use_yn 판단 근거 출력
-                print(f"      🔍 manage_id='{manage_id}' → use_yn='{use_yn_val}' (active 목록에 {'있음' if use_yn_val == 'y' else '없음'})")
-
-                # 공통 컬럼 SELECT 표현식 목록 구성
-                col_exprs = [f'd."{c}"' for c in ordered_common_cols]
-
-                # owner 컬럼 앞에 use_yn 삽입
-                # owner가 없으면 공통 컬럼 목록 맨 앞에 배치
-                if owner_idx is not None:
-                    col_exprs.insert(owner_idx, f"'{use_yn_val}'::CHAR(1) AS use_yn")
-                else:
-                    col_exprs.insert(0, f"'{use_yn_val}'::CHAR(1) AS use_yn")
-
-                column_string = ", ".join(col_exprs)
-
-                part = (
-                    f"SELECT '{manage_id}'::text AS manage_id,"
-                    f" '{r['name']}'::text AS project_name,"
-                    f" '{r['gpkg_name']}'::text AS source_gpkg,"
-                    f" '{t_name}'::text AS source_table,"
-                    f" '{q_type}'::text AS qfield_type,"
-                    f" {column_string}"
-                    f" FROM {TARGET_SCHEMA}.\"{t_name}\" d"
-                )
-                view_parts.append(part)
+            for r in rows:
+                t_name = r['table_name']
+                # 실제 DB에 해당 테이블이 물리적으로 존재하는지 최종 확인
+                cur.execute(f"SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = '{TARGET_SCHEMA}' AND table_name = %s)", (t_name,))
+                if cur.fetchone()[0]:
+                    # UNION 연산을 위해 컬럼 순서를 일정하게 맞추어 SELECT 문구 생성
+                    cur.execute(f"SELECT column_name FROM information_schema.columns WHERE table_schema = '{TARGET_SCHEMA}' AND table_name = %s AND column_name != 'seq' ORDER BY ordinal_position", (t_name,))
+                    columns = [f'd."{col[0]}"' for col in cur.fetchall()]
+                    column_string = ", ".join(columns)
+                    
+                    part = (
+                        f"SELECT '{r['id']}'::text as manage_id, '{r['name']}'::text as project_name, "
+                        f"'{r['gpkg_name']}'::text as source_gpkg, '{t_name}'::text as source_table, "
+                        f"'{q_type}'::text as qfield_type, {column_string} "
+                        f"FROM {TARGET_SCHEMA}.\"{t_name}\" d"
+                    )
+                    view_parts.append(part)
 
             # 수집된 SELECT 문들을 UNION ALL로 엮어서 하나의 VIEW로 통합 생성
-            specific_view_name = f"{TARGET_SCHEMA}.{q_type}_v_qfield_data"
-            create_view_sql = f"CREATE VIEW {specific_view_name} AS " + " UNION ALL ".join(view_parts)
-            _drop_create_view(specific_view_name, create_view_sql)
+            if view_parts:
+                specific_view_name = f"{q_type}_v_qfield_data"
+                create_view_sql = f"CREATE OR REPLACE VIEW {TARGET_SCHEMA}.{specific_view_name} AS " + " UNION ALL ".join(view_parts)
+                cur.execute(create_view_sql)
+                print(f"      ✅ 뷰 생성 완료: {TARGET_SCHEMA}.{specific_view_name}")
 
+        conn.commit()
     except Exception as e:
-        print(f"      ⚠️ 뷰 갱신 전체 오류: {e}")
+        if conn: conn.rollback()
+        print(f"      ⚠️ 뷰 생성 오류: {e}")
+    finally:
+        if conn:
+            cur.close()
+            conn.close()
 
 
 def sync_single_project(project_data):
     """
     하나의 프로젝트에 대해 전체 동기화 프로세스를 수행합니다.
-    1. 권한 부여는 메인 루프에서 job 조회 전에 이미 완료됨.
+    1. 212 DB 권한 강제 주입 (다운로드 권한 확보).
     2. 로컬의 이전 파일들 삭제 (중복 충돌 방지).
     3. SDK를 이용한 최신 프로젝트 파일 벌크 다운로드.
-       - 토큰 만료(401) 감지 시 재로그인 후 1회 재시도.
     4. 분석 로직(GPKG 분석 및 적재) 호출.
     5. 매칭 데이터가 전혀 없는 프로젝트는 공간 절약을 위해 파일 삭제.
     """
     global client
     p_id, p_name, p_owner = project_data['id'], project_data['name'], project_data['owner']
     project_path = os.path.join(BASE_OUTPUT_DIR, p_id)
-    # grant_admin_permission_via_db는 메인 루프에서 job 조회 전에 이미 실행됨
 
-    # 로컬 디렉토리 완전 초기화
+    # 1. 212 DB 직접 접근을 통한 admin 권한 활성화
+    grant_admin_permission_via_db(p_id)
+    time.sleep(1)
+
+    # 2. 로컬 디렉토리 완전 초기화
     if os.path.exists(project_path):
         try: shutil.rmtree(project_path)
         except: pass
     os.makedirs(project_path, exist_ok=True)
 
+    # 3. QFieldCloud 서버로부터 데이터 다운로드
     try:
         print(f"    🚀 [다운로드 시도] {p_name}")
-        if not client:
-            client = login_client()
-        if not client:
-            print(f"    ❌ client 없음, {p_name} 동기화 스킵")
-            return
+        if not client: client = login_client()
 
-        try:
-            client.download_project(
-                project_id=p_id,
-                local_dir=project_path,
-                filter_glob="*",
-                show_progress=False,
-                force_download=True
-            )
-        except Exception as dl_err:
-            err_str = str(dl_err)
-            # 토큰 만료(401) 감지 시 재로그인 후 1회 재시도
-            if "401" in err_str or "expired" in err_str.lower() or "Unauthorized" in err_str:
-                print(f"    🔑 다운로드 중 토큰 만료 → 재로그인 후 재시도: {p_name}")
-                client = login_client()
-                if client:
-                    client.download_project(
-                        project_id=p_id,
-                        local_dir=project_path,
-                        filter_glob="*",
-                        show_progress=False,
-                        force_download=True
-                    )
-                else:
-                    print(f"    ❌ 재로그인 실패, {p_name} 동기화 스킵")
-                    return
-            else:
-                raise
-
+        client.download_project(
+            project_id=p_id,
+            local_dir=project_path,
+            filter_glob="*",
+            show_progress=False,
+            force_download=True
+        )
         print(f"    ✅ [다운로드 완료] {p_name}")
 
-        # 분석 및 적재 시작
+        # 4. 분석 및 적재 시작
         matched = process_gpkg_to_db(p_id, project_path, p_name, p_owner)
 
-        # 매칭 레이어가 없는 프로젝트는 공간 절약을 위해 로컬 파일 삭제
+        # 5. 불필요한 파일 정리
         if not matched:
             print(f"    🗑️ [파일 삭제] 매칭 레이어 없음")
             try: shutil.rmtree(project_path)
             except: pass
 
     except Exception as e:
-        err_str = str(e)
         # 인증 오류(401) 발생 시 로그인을 재시도하도록 클라이언트 초기화
-        if "401" in err_str or "expired" in err_str.lower() or "Unauthorized" in err_str:
-            print(f"    🔑 토큰 만료 감지 → 재로그인 시도")
+        if "401" in str(e) or "Unauthorized" in str(e):
             client = login_client()
         print(f"    ⚠️ {p_name} 처리 실패: {e}")
 
@@ -900,45 +538,19 @@ def get_latest_job_id(project_id):
     사용자가 모바일 기기에서 QField 데이터를 서버로 'Push' 했을 때 생성되는
     'delta_apply'(변경사항 적용) 작업의 최신 ID를 조회합니다.
     성공적으로 끝난(finished) 작업의 ID가 이전과 달라졌다면, 새로운 데이터가 업로드된 것으로 판단합니다.
-
-    [반환값]
-    - job ID 문자열: 정상 조회 성공
-    - "NO_JOB"    : 완료된 delta_apply job이 없음 (첫 업로드 전)
-    - None        : 조회 자체가 실패한 경우 → 캐시에 저장하지 않고 다음 루프에서 재시도
-                    (기존 "JOB_CHECK_ERROR" 반환은 캐시에 저장되어 이후 변경 감지 불가 문제 유발)
     """
     global client
     try:
-        if not client:
-            client = login_client()
-        if not client:
-            print(f"    ⚠️ [job 조회 실패] client 없음: {project_id[:8]}...")
-            return None
+        if not client: client = login_client()
         jobs = client.list_jobs(project_id)
         # delta_apply 타입 중 성공한 작업들만 필터링
         delta_jobs = [j for j in jobs if j.get('type') == 'delta_apply' and j.get('status') == 'finished']
-        if not delta_jobs:
-            return "NO_JOB"
+        if not delta_jobs: return "NO_JOB"
         # 생성 시간 순으로 정렬하여 가장 최근 것 선택
         delta_jobs.sort(key=lambda j: j.get('created_at', ''), reverse=True)
         return delta_jobs[0]['id']
-    except Exception as e:
-        err_str = str(e)
-        print(f"    ⚠️ [job 조회 실패] project={project_id[:8]}... 원인: {type(e).__name__}: {err_str[:120]}")
-        # 토큰 만료(401 / Token has expired) → 즉시 재로그인
-        if "401" in err_str or "expired" in err_str.lower() or "Unauthorized" in err_str:
-            print(f"    🔑 토큰 만료 감지 → 재로그인 시도...")
-            try:
-                client = login_client()
-            except Exception as re_err:
-                print(f"    ❌ 재로그인 실패: {re_err}")
-        else:
-            # 그 외 일시적 오류도 재로그인 시도
-            try:
-                client = login_client()
-            except Exception:
-                pass
-        return None  # None 반환 → 캐시 저장 방지, 다음 루프에서 재시도
+    except:
+        return "JOB_CHECK_ERROR"
 
 
 def get_all_projects_from_db():
@@ -962,129 +574,39 @@ def get_all_projects_from_db():
     return projects
 
 
-# ========== 관리 테이블 초기화 ==========
-with db_engine.begin() as conn:
-    conn.execute(text(
-        f"CREATE TABLE IF NOT EXISTS {TARGET_SCHEMA}.qfield_data_manage ("
-        f"seq SERIAL PRIMARY KEY, id TEXT, name TEXT, gpkg_name TEXT, "
-        f"table_name TEXT, owner TEXT, qfield_type TEXT, "
-        f"reg_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
-        f"update_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
-        f"CONSTRAINT unique_gpkg_per_project UNIQUE (id, gpkg_name))"
-    ))
-
 # ========== 메인 실행 루프 (Infinite Loop) ==========
 # 30초 간격으로 무한 반복하며 QFieldCloud의 모든 프로젝트를 감시합니다.
 last_jobs_cache = {} # 메모리 상에서 프로젝트별로 처리 완료된 최신 Job ID를 기억함
-print(f"[{datetime.now()}] 🚀 실시간 동기화 엔진 가동 중...", flush=True)
+print(f"[{datetime.now()}] 🚀 실시간 동기화 엔진 가동 중...")
 
 while True:
     try:
-        # client 상태 확인 (리눅스 서버에서 장시간 실행 시 세션 만료 대응)
-        if not client:
-            print(f"[{datetime.now()}] ⚠️ client 없음, 재로그인 시도...")
-            client = login_client()
-
         # 1. 212 DB를 통해 현재 운영 중인 모든 프로젝트 목록 확보
         current_projects = get_all_projects_from_db()
-        current_ids = set(p['id'] for p in current_projects)
-        print(f"    📋 프로젝트 {len(current_projects)}개 확인됨", flush=True)
-
-        # ── 삭제된 프로젝트 정리 ──
-        # 212 DB에서 사라진 프로젝트(유령 프로젝트)를 215 DB에서도 제거합니다.
-        # qfield_data_manage에 남아있지만 current_ids에 없는 항목이 대상입니다.
-        try:
-            with get_pg_conn_safe() as ghost_conn:
-                with ghost_conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as ghost_cur:
-                    # 215 DB 관리 테이블에서 현재 존재하지 않는 프로젝트 ID 목록 조회
-                    ghost_cur.execute(
-                        f"SELECT DISTINCT id, name FROM {TARGET_SCHEMA}.qfield_data_manage"
-                    )
-                    managed_rows = ghost_cur.fetchall()
-
-                # current_ids에 없는 항목 = 삭제된 프로젝트
-                ghost_ids = {
-                    str(r['id']): r['name']
-                    for r in managed_rows
-                    if str(r['id']).strip().lower() not in {cid.strip().lower() for cid in current_ids}
-                }
-
-            if ghost_ids:
-                for ghost_id, ghost_name in ghost_ids.items():
-                    print(f"    🗑️ [삭제된 프로젝트 감지] {ghost_name} ({ghost_id})")
-                    _cleanup_deleted_project(ghost_id, ghost_name)
-                # 유령 프로젝트 정리 후 뷰도 갱신
-                update_unified_view()
-                # 캐시에서도 제거
-                for ghost_id in ghost_ids:
-                    last_jobs_cache.pop(ghost_id, None)
-
-        except Exception as ghost_err:
-            print(f"    ⚠️ 삭제 프로젝트 정리 오류: {ghost_err}")
-
         for p in current_projects:
             p_id = p['id']
             project_path = os.path.join(BASE_OUTPUT_DIR, p_id)
+            
+            # 2. 각 프로젝트별로 최신 성공 작업 ID 조회
+            current_job_id = get_latest_job_id(p_id)
 
-            try:
-                # job 조회 전에 먼저 권한을 부여합니다.
-                # 권한 없이 job 조회 시 admin이 collaborator로 등록되지 않은 프로젝트는 404를 반환합니다.
-                grant_admin_permission_via_db(p_id)
-
-                # 2. 각 프로젝트별로 최신 성공 작업 ID 조회
-                current_job_id = get_latest_job_id(p_id)
-
-                # job 조회 자체가 실패(None)하면 캐시 갱신 없이 스킵
-                # → 다음 루프에서 재시도하므로 무한 스킵 방지
-                if current_job_id is None:
-                    print(f"    ⏭️ [스킵] job 조회 실패, 다음 루프 재시도: {p['name']}")
-                    continue
-
-                cached_job_id = last_jobs_cache.get(p_id)
-                path_exists   = os.path.exists(project_path)
-                first_run     = (p_id not in last_jobs_cache)
-                job_changed   = (current_job_id != cached_job_id)
-
-                # 디버그 로그: 동기화 판단 근거 출력 (리눅스 서버 문제 진단용)
-                short_job    = current_job_id[:8] if len(current_job_id) > 8 else current_job_id
-                short_cached = str(cached_job_id)[:8] if cached_job_id else 'None'
-                print(
-                    f"    🔎 [{p['name']}] job={short_job} cached={short_cached}"
-                    f" path={path_exists} changed={job_changed} first={first_run}",
-                    flush=True
-                )
-
-                # 3. 변경 감지 조건:
-                # - 캐시에 정보가 없거나 (처음 실행)
-                # - 로컬에 파일이 없거나 (실수로 삭제된 경우)
-                # - 서버의 Job ID가 이전과 다를 때 (사용자가 기기에서 업로드 완료 시)
-                needs_sync = first_run or not path_exists or job_changed
-
-                if needs_sync:
-                    reason = '첫실행' if first_run else ('경로없음' if not path_exists else 'job변경')
-                    print(f"[{datetime.now()}] 🔄 변경 감지: {p['name']} (소유자: {p['owner']}, 사유: {reason})")
-
-                    # 실질적인 동기화 및 DB 적재 수행
-                    sync_single_project(p)
-
-                    # 처리 완료된 Job ID를 캐시에 저장하여 중복 실행 방지
-                    last_jobs_cache[p_id] = current_job_id
-
-            except Exception as e:
-                print(f"    ⚠️ 프로젝트 처리 오류 ({p['name']}): {e}")
+            # 3. 변경 감지 조건:
+            # - 캐시에 정보가 없거나 (처음 실행)
+            # - 로컬에 파일이 없거나 (실수로 삭제된 경우)
+            # - 서버의 Job ID가 이전과 다를 때 (사용자가 기기에서 업로드 완료 시)
+            if p_id not in last_jobs_cache or not os.path.exists(project_path) or current_job_id != last_jobs_cache[p_id]:
+                print(f"[{datetime.now()}] 🔄 변경 감지: {p['name']} (소유자: {p['owner']})")
+                
+                # 실질적인 동기화 및 DB 적재 수행
+                sync_single_project(p)
+                
+                # 처리 완료된 Job ID를 캐시에 저장하여 중복 실행 방지
+                last_jobs_cache[p_id] = current_job_id
 
     except Exception as e:
         print(f"⚠️ 루프 에러: {e}")
         time.sleep(5)
         client = login_client() # 치명적 에러 발생 시 세션 재로그인 시도
 
-    finally:
-        # 루프 끝에 엔진 풀 정리 (좀비 커넥션 방지)
-        try:
-            db_engine.dispose()
-        except Exception:
-            pass
-
     # 과도한 API 호출 방지를 위해 지정된 주기(30초)만큼 대기
-    print(f"[{datetime.now()}] 💤 대기 중 ({CHECK_INTERVAL}초)...", flush=True)
     time.sleep(CHECK_INTERVAL)
