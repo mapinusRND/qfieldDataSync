@@ -570,6 +570,7 @@ def get_all_projects_from_db():
 
 
 # ========== 메인 실행 루프 ==========
+# 
 last_jobs_cache = {}
 skip_project_ids = set()
 
