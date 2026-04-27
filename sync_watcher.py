@@ -418,62 +418,63 @@ def process_gpkg_to_db(project_id, project_path, project_name, owner):
 
 
 def update_unified_view():
-    """
-    분산되어 적재된 여러 사용자의 개별 테이블들을 '재난 타입별'로 하나로 묶어줍니다.
-    dashboard나 GIS 클라이언트에서 조회하기 편하도록 'rain_v_qfield_data' 같은 이름의 VIEW를 생성합니다.
-    동일한 컬럼 구조를 가진 테이블들을 'UNION ALL'로 결합하는 SQL을 동적으로 생성하여 실행합니다.
-    """
     print(f"    📊 [개별 뷰 갱신 시작]")
     conn = None
     try:
         conn = get_pg_conn()
+        conn.autocommit = True  # ✅ DDL 락 즉시 해제 — 핵심
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-        
-        # 현재 DB에 관리 중인 재난 타입(예: rain, fire) 종류 조회
+
         cur.execute(f"SELECT DISTINCT qfield_type FROM {TARGET_SCHEMA}.qfield_data_manage WHERE qfield_type IS NOT NULL")
         types = [r['qfield_type'] for r in cur.fetchall()]
-
-        if not types: return
+        if not types:
+            return
 
         for q_type in types:
-            # 해당 타입에 속하는 모든 물리 테이블 리스트 조회
             cur.execute(f"SELECT id, name, gpkg_name, table_name FROM {TARGET_SCHEMA}.qfield_data_manage WHERE qfield_type = %s", (q_type,))
             rows = cur.fetchall()
-            
+
             view_parts = []
             for r in rows:
                 t_name = r['table_name']
-                # 실제 DB에 해당 테이블이 물리적으로 존재하는지 최종 확인
                 cur.execute(f"SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = '{TARGET_SCHEMA}' AND table_name = %s)", (t_name,))
-                if cur.fetchone()[0]:
-                    # UNION 연산을 위해 컬럼 순서를 일정하게 맞추어 SELECT 문구 생성
-                    cur.execute(f"SELECT column_name FROM information_schema.columns WHERE table_schema = '{TARGET_SCHEMA}' AND table_name = %s AND column_name != 'seq' ORDER BY ordinal_position", (t_name,))
-                    columns = [f'd."{col[0]}"' for col in cur.fetchall()]
-                    column_string = ", ".join(columns)
-                    
-                    part = (
-                        f"SELECT '{r['id']}'::text as manage_id, '{r['name']}'::text as project_name, "
-                        f"'{r['gpkg_name']}'::text as source_gpkg, '{t_name}'::text as source_table, "
-                        f"'{q_type}'::text as qfield_type, {column_string} "
-                        f"FROM {TARGET_SCHEMA}.\"{t_name}\" d"
-                    )
-                    view_parts.append(part)
+                if not cur.fetchone()[0]:
+                    continue
 
-            # 수집된 SELECT 문들을 UNION ALL로 엮어서 하나의 VIEW로 통합 생성
+                cur.execute(f"SELECT column_name FROM information_schema.columns WHERE table_schema = '{TARGET_SCHEMA}' AND table_name = %s AND column_name != 'seq' ORDER BY ordinal_position", (t_name,))
+                columns = [f'd."{col[0]}"' for col in cur.fetchall()]
+                column_string = ", ".join(columns)
+
+                part = (
+                    f"SELECT '{r['id']}'::text as manage_id, '{r['name']}'::text as project_name, "
+                    f"'{r['gpkg_name']}'::text as source_gpkg, '{t_name}'::text as source_table, "
+                    f"'{q_type}'::text as qfield_type, {column_string} "
+                    f"FROM {TARGET_SCHEMA}.\"{t_name}\" d"
+                )
+                view_parts.append(part)
+
             if view_parts:
                 specific_view_name = f"{q_type}_v_qfield_data"
-                create_view_sql = f"CREATE OR REPLACE VIEW {TARGET_SCHEMA}.{specific_view_name} AS " + " UNION ALL ".join(view_parts)
-                cur.execute(create_view_sql)
-                print(f"      ✅ 뷰 생성 완료: {TARGET_SCHEMA}.{specific_view_name}")
+                # ✅ CREATE OR REPLACE 대신 DROP → CREATE (REPLACE가 락 잡는 경우 방어)
+                try:
+                    cur.execute(f"DROP VIEW IF EXISTS {TARGET_SCHEMA}.{specific_view_name}")
+                except Exception as drop_err:
+                    print(f"      ⚠️ 뷰 DROP 실패: {drop_err}")
+                try:
+                    cur.execute(f"CREATE VIEW {TARGET_SCHEMA}.{specific_view_name} AS " + " UNION ALL ".join(view_parts))
+                    print(f"      ✅ 뷰 생성 완료: {TARGET_SCHEMA}.{specific_view_name}")
+                except Exception as view_err:
+                    print(f"      ❌ 뷰 생성 실패: {specific_view_name} → {view_err}")
 
-        conn.commit()
     except Exception as e:
-        if conn: conn.rollback()
-        print(f"      ⚠️ 뷰 생성 오류: {e}")
+        print(f"      ⚠️ 뷰 갱신 오류: {e}")
     finally:
-        if conn:
-            cur.close()
-            conn.close()
+        # ✅ autocommit 모드라 rollback 불필요, 커넥션만 닫기
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
 
 
 def sync_single_project(project_data):
@@ -568,61 +569,105 @@ def get_all_projects_from_db():
     return projects
 
 
-# 30초 간격으로 무한 반복하며 QFieldCloud의 모든 프로젝트를 감시합니다.
-# ========== 메인 실행 루프 (안정성 및 삭제 로직 강화) ==========
-last_jobs_cache = {} 
+# ========== 메인 실행 루프 ==========
+last_jobs_cache = {}
+skip_project_ids = set()
+
 print(f"[{datetime.now()}] 🚀 실시간 동기화 엔진 가동 중...", flush=True)
 
 while True:
     try:
-        # 1. 운영 DB(212)에서 현재 존재하는 모든 프로젝트 목록 확보
         current_projects = get_all_projects_from_db()
+        current_projects = [p for p in current_projects if p.get('id')]
         current_project_ids = [p['id'] for p in current_projects]
-        
+
         ghost_found = False
 
-        # 2. 🔥 [핵심 추가] 유령 데이터 클리닝 (삭제된 프로젝트 처리)
+        # ✅ 유령 프로젝트 정리 — 전부 autocommit 커넥션으로 통일
         if current_project_ids:
-            # SQL IN 문법 대응
             id_params_str = str(tuple(current_project_ids)) if len(current_project_ids) > 1 else f"('{current_project_ids[0]}')"
 
-            with db_engine.begin() as conn:
-                # 운영 DB 리스트에 없는 ID를 가진 관리 이력 조회
-                ghost_tables_res = conn.execute(text(f"""
-                    SELECT table_name, id, name FROM {TARGET_SCHEMA}.qfield_data_manage 
-                    WHERE id NOT IN {id_params_str}
-                """))
-                
-                ghost_list = ghost_tables_res.fetchall()
-                if ghost_list:
-                    print(f"[{datetime.now()}] 🧹 삭제된 프로젝트 감지: {len(ghost_list)}개를 정리합니다.")
-                    for row in ghost_list:
-                        t_name, p_id, p_name = row[0], row[1], row[2]
-                        # 물리 테이블 삭제 (CASCADE로 뷰 의존성 자동 해제)
-                        conn.execute(text(f'DROP TABLE IF EXISTS {TARGET_SCHEMA}."{t_name}" CASCADE'))
-                        # 관리 이력 삭제
-                        conn.execute(text(f"DELETE FROM {TARGET_SCHEMA}.qfield_data_manage WHERE id = :pid"), {"pid": p_id})
-                        print(f"    🗑️ 제거 완료: {p_name} ({p_id})")
-                    ghost_found = True
+            ghost_conn = None
+            try:
+                ghost_conn = get_pg_conn()
+                ghost_conn.autocommit = True  # ✅ DDL 락 즉시 해제
+                ghost_cur = ghost_conn.cursor()
 
-        # 삭제된 게 있다면 통합 뷰도 즉시 갱신
+                # 1단계: 유령 목록 조회
+                ghost_cur.execute(f"""
+                    SELECT table_name, id, name FROM {TARGET_SCHEMA}.qfield_data_manage
+                    WHERE id NOT IN {id_params_str}
+                """)
+                ghost_list = ghost_cur.fetchall()
+
+                if ghost_list:
+                    print(f"[{datetime.now()}] 🧹 삭제된 프로젝트 감지: {len(ghost_list)}개 정리")
+                    for row in ghost_list:
+                        g_table, g_id, g_name = row[0], row[1], row[2]
+                        try:
+                            # 2단계: 물리 테이블 삭제
+                            ghost_cur.execute(f'DROP TABLE IF EXISTS {TARGET_SCHEMA}."{g_table}" CASCADE')
+                            # 3단계: 관리 이력 삭제
+                            ghost_cur.execute(
+                                f"DELETE FROM {TARGET_SCHEMA}.qfield_data_manage WHERE id = %s",
+                                (g_id,)
+                            )
+                            print(f"    🗑️ 제거 완료: {g_name} ({g_id})")
+                            ghost_found = True
+                        except Exception as ge:
+                            print(f"    ⚠️ 유령 정리 실패: {g_table} → {ge}")
+
+            except Exception as e:
+                print(f"    ⚠️ 유령 조회 오류: {e}")
+            finally:
+                if ghost_conn:
+                    ghost_conn.close()
+
+        # ✅ 트랜잭션 완전히 닫힌 후 뷰 갱신
         if ghost_found:
             update_unified_view()
 
-        # 3. 실재하는 프로젝트들 대상 동기화 진행
+        # ✅ 실존 프로젝트 동기화
         for p in current_projects:
             p_id = p['id']
+            if p_id in skip_project_ids:
+                continue
+
             project_path = os.path.join(BASE_OUTPUT_DIR, p_id)
             current_job_id = get_latest_job_id(p_id)
 
-            if p_id not in last_jobs_cache or not os.path.exists(project_path) or current_job_id != last_jobs_cache[p_id]:
-                print(f"[{datetime.now()}] 🔄 변경/업데이트 감지: {p['name']}")
-                sync_single_project(p)
+            if current_job_id == "PROJECT_NOT_FOUND":
+                skip_project_ids.add(p_id)
+                last_jobs_cache[p_id] = "PROJECT_NOT_FOUND"
+                print(f"    🚫 [영구 스킵] {p['name']}")
+                continue
+
+            if current_job_id == "JOB_CHECK_ERROR":
+                continue
+
+            needs_sync = (
+                p_id not in last_jobs_cache
+                or not os.path.exists(project_path)
+                or current_job_id != last_jobs_cache[p_id]
+            )
+
+            if needs_sync:
+                print(f"[{datetime.now()}] 🔄 변경 감지: {p['name']} ({p['owner']})")
+                try:
+                    sync_single_project(p)
+                except Exception as sync_err:
+                    if "404" in str(sync_err) or "Not Found" in str(sync_err):
+                        skip_project_ids.add(p_id)
+                        print(f"    🚫 [404 스킵] {p['name']}")
+                    else:
+                        print(f"    ❌ [오류] {p['name']}: {sync_err}")
+
                 last_jobs_cache[p_id] = current_job_id
 
     except Exception as e:
-        print(f"⚠️ 루프 에러 발생: {e}", flush=True)
+        print(f"⚠️ 루프 에러: {e}", flush=True)
         time.sleep(5)
         client = login_client()
 
+    print(f"[{datetime.now()}] 💤 {CHECK_INTERVAL}초 대기 | 스킵: {len(skip_project_ids)}개")
     time.sleep(CHECK_INTERVAL)
