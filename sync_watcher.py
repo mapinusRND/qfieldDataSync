@@ -307,150 +307,223 @@ def save_gdf_direct(gdf, table_name, schema, project_path, owner_name, allowed_c
 # ---------- GPKG 분석 및 워크플로우 제어 함수 ----------
 
 def process_gpkg_to_db(project_id, project_path, project_name, owner):
+    """
+    다운로드된 프로젝트 폴더 내의 모든 .gpkg 파일을 스캔하여 분석 및 적재를 수행합니다.
+    1. 관리 테이블(qfield_data_manage) 생성 및 프로젝트 변환 이력 관리.
+    2. GPKG 내의 각 레이어를 개별 데이터프레임으로 변환.
+    3. 좌표계를 3857로 통일하고 고유 테이블 명칭을 생성하여 save_gdf_direct 호출.
+    4. 분석 결과가 업데이트되면 최종 통합 뷰(VIEW)를 갱신하도록 트리거합니다.
+    """
     print(f"    🔍 [분석 시작] {project_name}")
-    short_id, now = project_id[:13], datetime.now()
-    clean_owner = owner.lower().replace(' ', '_').replace('-', '_')
+    short_id = project_id[:13] # 테이블 명칭 길이를 제한하기 위한 ID 슬라이싱
+    now = datetime.now()
+    clean_owner = owner.lower().replace(' ', '_').replace('-', '_') # DB 명칭 규칙 준수용 치환
 
+    # 데이터 분류를 위한 기준 정보 로드
     qfield_info_map = get_qfield_info_column_lists()
-    if not qfield_info_map: return False
-
-    any_updated, global_table_index = False, 1
-    
-    # 경로가 없으면 즉시 리턴
-    if not os.path.exists(project_path): return False
-
-    files = [f for f in os.listdir(project_path) if f.endswith(".gpkg")]
-    if not files:
-        print(f"    ℹ️ {project_name}: 처리할 GPKG 파일이 없습니다.")
+    if not qfield_info_map:
         return False
 
+    # 어떤 프로젝트가 어떤 물리 테이블과 매칭되는지 기록하는 통합 관리 테이블
+    with db_engine.connect() as conn:
+        conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS {TARGET_SCHEMA}.qfield_data_manage (
+                seq SERIAL PRIMARY KEY,
+                id TEXT,
+                name TEXT,
+                gpkg_name TEXT,
+                table_name TEXT,
+                owner TEXT,
+                qfield_type TEXT,
+                reg_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                update_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT unique_gpkg_per_project UNIQUE (id, gpkg_name)
+            )
+        """))
+        conn.commit()
+
+    any_updated, global_table_index = False, 1
+    if not os.path.exists(project_path): return False
+
+    # 프로젝트 폴더 내의 모든 GeoPackage 파일 리스트 확보
+    files = [f for f in os.listdir(project_path) if f.endswith(".gpkg")]
+
     for file in files:
-        # 🔥 여기서 file_stem이 확실하게 선언됩니다.
         gpkg_path = os.path.join(project_path, file)
-        file_stem = os.path.splitext(file)[0] 
+        file_stem = os.path.splitext(file)[0]
         
         try:
             import fiona
-            for layer_name in fiona.listlayers(gpkg_path):
-                if layer_name.lower() in ['layer_styles', 'geopackage_contents', 'gpkg_contents']: 
+            layers = fiona.listlayers(gpkg_path)
+            for layer_name in layers:
+                # QGIS 내부 관리용 시스템 레이어는 데이터 분석에서 제외
+                if layer_name.lower() in ['layer_styles', 'geopackage_contents', 'gpkg_contents']:
                     continue
-                
+
+                # 레이어 읽기 및 빈 데이터 체크
                 gdf = gpd.read_file(gpkg_path, layer=layer_name)
                 if gdf.empty: continue
 
-                is_geo = isinstance(gdf, gpd.GeoDataFrame) and gdf.geometry is not None
-                gpkg_columns = [c for c in gdf.columns if c != (gdf.geometry.name if is_geo else None)]
-                matched_type, matched_cols = find_matching_qfield_type(gpkg_columns, qfield_info_map)
+                # 지리 정보 유무 확인 및 컬럼 목록 추출
+                is_geo = (isinstance(gdf, gpd.GeoDataFrame) and gdf.geometry is not None)
+                geom_col = gdf.geometry.name if is_geo else None
+                gpkg_columns = [c for c in gdf.columns if c != geom_col]
 
-                if matched_type:
-                    print(f"        ✅ [매칭 성공] type='{matched_type}' ({file})")
-                    gdf = gdf.to_crs(epsg=3857) if gdf.crs else gdf.set_crs(epsg=5186).to_crs(epsg=3857)
-                    gdf = gdf.assign(owner=owner, reg_date=now, update_at=now)
-                    
-                    table_name = f"{clean_owner}_{short_id}_{global_table_index}"
-                    save_gdf_direct(gdf, table_name, TARGET_SCHEMA, project_path, owner, allowed_columns=matched_cols)
+                # 해당 레이어가 우리가 관리하는 '재난 타입'에 해당하는지 판별
+                matched_type, matched_col_list = find_matching_qfield_type(gpkg_columns, qfield_info_map)
 
-                    # 🔥 DB 관리 이력 업데이트 로직이 반드시 루프 안에 있어야 합니다.
-                    with db_engine.connect() as conn:
-                        conn.execute(text(f"""
-                            INSERT INTO {TARGET_SCHEMA}.qfield_data_manage 
-                                (id, name, gpkg_name, table_name, owner, qfield_type, reg_date, update_at)
-                            VALUES 
-                                (:pid, :pname, :gname, :tname, :owner, :qtype, :now, :now)
-                            ON CONFLICT (id, gpkg_name) DO UPDATE SET 
-                                update_at = EXCLUDED.update_at,
-                                table_name = EXCLUDED.table_name,
-                                name = EXCLUDED.name
-                        """), {
-                            "pid": project_id, "pname": project_name, "gname": file_stem, # 여기서 사용
-                            "tname": table_name, "owner": owner, "qtype": matched_type, "now": now
-                        })
-                        conn.commit()
-                    
-                    any_updated = True
-                    global_table_index += 1
-                    
+                if matched_type is None:
+                    print(f"        ⏭️ [스킵] '{layer_name}' - 매칭 타입 없음")
+                    continue
+
+                print(f"        ✅ [매칭 성공] type='{matched_type}'")
+
+                # 좌표계 통일: 원본 CRS가 있으면 3857로 변환, 없으면 기본값(5186) 부여 후 변환
+                gdf = gdf.to_crs(epsg=3857) if gdf.crs else gdf.set_crs(epsg=5186).to_crs(epsg=3857)
+                gdf = gdf.assign(owner=owner, reg_date=now, update_at=now)
+
+                # 개별 테이블명 생성 (소유자_ID_순번) 및 DB 전송
+                table_name = f"{clean_owner}_{short_id}_{global_table_index}"
+                save_gdf_direct(gdf, table_name, TARGET_SCHEMA, project_path, owner, allowed_columns=matched_col_list)
+
+                # 관리 테이블에 변환 이력 기록 (이미 있는 파일이면 최신 정보로 UPDATE)
+                with db_engine.connect() as conn:
+                    conn.execute(text(f"""
+                        INSERT INTO {TARGET_SCHEMA}.qfield_data_manage
+                            (id, name, gpkg_name, table_name, owner, qfield_type, reg_date, update_at)
+                        VALUES
+                            (:pid, :pname, :gname, :tname, :owner, :qtype, :now, :now)
+                        ON CONFLICT (id, gpkg_name) DO UPDATE SET
+                            name = EXCLUDED.name,
+                            table_name = EXCLUDED.table_name,
+                            owner = EXCLUDED.owner,
+                            qfield_type = EXCLUDED.qfield_type,
+                            update_at = EXCLUDED.update_at
+                    """), {
+                        "pid": project_id, "pname": project_name, "gname": file_stem,
+                        "tname": table_name, "owner": owner, "qtype": matched_type, "now": now
+                    })
+                    conn.commit()
+
+                any_updated, global_table_index = True, global_table_index + 1
+
         except Exception as e:
             print(f"        ⚠️ {file} 처리 중 에러: {e}")
 
+    # 하나라도 데이터가 갱신되었다면 UNION ALL 기반의 대시보드용 뷰를 다시 생성합니다.
     if any_updated:
         update_unified_view()
-        
+
     return any_updated
 
 
 def update_unified_view():
-    print(f"    📊 [통합 뷰 갱신 시작]")
+    """
+    분산되어 적재된 여러 사용자의 개별 테이블들을 '재난 타입별'로 하나로 묶어줍니다.
+    dashboard나 GIS 클라이언트에서 조회하기 편하도록 'rain_v_qfield_data' 같은 이름의 VIEW를 생성합니다.
+    동일한 컬럼 구조를 가진 테이블들을 'UNION ALL'로 결합하는 SQL을 동적으로 생성하여 실행합니다.
+    """
+    print(f"    📊 [개별 뷰 갱신 시작]")
     conn = None
     try:
         conn = get_pg_conn()
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        
+        # 현재 DB에 관리 중인 재난 타입(예: rain, fire) 종류 조회
         cur.execute(f"SELECT DISTINCT qfield_type FROM {TARGET_SCHEMA}.qfield_data_manage WHERE qfield_type IS NOT NULL")
         types = [r['qfield_type'] for r in cur.fetchall()]
 
+        if not types: return
+
         for q_type in types:
-            # 🔥 핵심 수정: 동일 프로젝트 내에서 가장 최근에 업데이트(update_at DESC)된 테이블 1개만 선택
-            query = f"""
-                WITH latest_tables AS (
-                    SELECT id, name, gpkg_name, table_name,
-                           ROW_NUMBER() OVER(PARTITION BY id, gpkg_name ORDER BY update_at DESC) as rn
-                    FROM {TARGET_SCHEMA}.qfield_data_manage
-                    WHERE qfield_type = %s
-                )
-                SELECT * FROM latest_tables WHERE rn = 1
-            """
-            cur.execute(query, (q_type,))
+            # 해당 타입에 속하는 모든 물리 테이블 리스트 조회
+            cur.execute(f"SELECT id, name, gpkg_name, table_name FROM {TARGET_SCHEMA}.qfield_data_manage WHERE qfield_type = %s", (q_type,))
             rows = cur.fetchall()
             
             view_parts = []
             for r in rows:
                 t_name = r['table_name']
+                # 실제 DB에 해당 테이블이 물리적으로 존재하는지 최종 확인
                 cur.execute(f"SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = '{TARGET_SCHEMA}' AND table_name = %s)", (t_name,))
                 if cur.fetchone()[0]:
+                    # UNION 연산을 위해 컬럼 순서를 일정하게 맞추어 SELECT 문구 생성
                     cur.execute(f"SELECT column_name FROM information_schema.columns WHERE table_schema = '{TARGET_SCHEMA}' AND table_name = %s AND column_name != 'seq' ORDER BY ordinal_position", (t_name,))
                     columns = [f'd."{col[0]}"' for col in cur.fetchall()]
+                    column_string = ", ".join(columns)
+                    
                     part = (
                         f"SELECT '{r['id']}'::text as manage_id, '{r['name']}'::text as project_name, "
                         f"'{r['gpkg_name']}'::text as source_gpkg, '{t_name}'::text as source_table, "
-                        f"'{q_type}'::text as qfield_type, {', '.join(columns)} "
+                        f"'{q_type}'::text as qfield_type, {column_string} "
                         f"FROM {TARGET_SCHEMA}.\"{t_name}\" d"
                     )
                     view_parts.append(part)
 
+            # 수집된 SELECT 문들을 UNION ALL로 엮어서 하나의 VIEW로 통합 생성
             if view_parts:
                 specific_view_name = f"{q_type}_v_qfield_data"
-                # 🔥 수정 사항: OR REPLACE 대신 DROP 후 CREATE로 컬럼 변경 사항까지 완벽 대응
-                cur.execute(f"DROP VIEW IF EXISTS {TARGET_SCHEMA}.{specific_view_name}")
-                cur.execute(f"CREATE VIEW {TARGET_SCHEMA}.{specific_view_name} AS " + " UNION ALL ".join(view_parts))
-                print(f"      ✅ [뷰 갱신 완료] {specific_view_name}")
+                create_view_sql = f"CREATE OR REPLACE VIEW {TARGET_SCHEMA}.{specific_view_name} AS " + " UNION ALL ".join(view_parts)
+                cur.execute(create_view_sql)
+                print(f"      ✅ 뷰 생성 완료: {TARGET_SCHEMA}.{specific_view_name}")
+
         conn.commit()
     except Exception as e:
         if conn: conn.rollback()
         print(f"      ⚠️ 뷰 생성 오류: {e}")
     finally:
-        if conn: conn.close()
+        if conn:
+            cur.close()
+            conn.close()
 
 
 def sync_single_project(project_data):
+    """
+    하나의 프로젝트에 대해 전체 동기화 프로세스를 수행합니다.
+    1. 212 DB 권한 강제 주입 (다운로드 권한 확보).
+    2. 로컬의 이전 파일들 삭제 (중복 충돌 방지).
+    3. SDK를 이용한 최신 프로젝트 파일 벌크 다운로드.
+    4. 분석 로직(GPKG 분석 및 적재) 호출.
+    5. 매칭 데이터가 전혀 없는 프로젝트는 공간 절약을 위해 파일 삭제.
+    """
     global client
     p_id, p_name, p_owner = project_data['id'], project_data['name'], project_data['owner']
     project_path = os.path.join(BASE_OUTPUT_DIR, p_id)
-    grant_admin_permission_via_db(p_id)
 
-    # 🔥 수정 사항: 리눅스 커널이 파일 삭제를 완료할 수 있도록 0.5초 대기 시간을 부여
+    # 1. 212 DB 직접 접근을 통한 admin 권한 활성화
+    grant_admin_permission_via_db(p_id)
+    time.sleep(1)
+
+    # 2. 로컬 디렉토리 완전 초기화
     if os.path.exists(project_path):
-        try:
-            shutil.rmtree(project_path)
-            time.sleep(0.5) 
+        try: shutil.rmtree(project_path)
         except: pass
     os.makedirs(project_path, exist_ok=True)
 
+    # 3. QFieldCloud 서버로부터 데이터 다운로드
     try:
+        print(f"    🚀 [다운로드 시도] {p_name}")
         if not client: client = login_client()
-        client.download_project(project_id=p_id, local_dir=project_path, filter_glob="*", force_download=True)
+
+        client.download_project(
+            project_id=p_id,
+            local_dir=project_path,
+            filter_glob="*",
+            show_progress=False,
+            force_download=True
+        )
         print(f"    ✅ [다운로드 완료] {p_name}")
-        process_gpkg_to_db(p_id, project_path, p_name, p_owner)
+
+        # 4. 분석 및 적재 시작
+        matched = process_gpkg_to_db(p_id, project_path, p_name, p_owner)
+
+        # 5. 불필요한 파일 정리
+        if not matched:
+            print(f"    🗑️ [파일 삭제] 매칭 레이어 없음")
+            try: shutil.rmtree(project_path)
+            except: pass
+
     except Exception as e:
+        # 인증 오류(401) 발생 시 로그인을 재시도하도록 클라이언트 초기화
         if "401" in str(e) or "Unauthorized" in str(e):
             client = login_client()
         print(f"    ⚠️ {p_name} 처리 실패: {e}")
@@ -461,16 +534,15 @@ def get_latest_job_id(project_id):
     try:
         if not client: client = login_client()
         jobs = client.list_jobs(project_id)
-        # 🔥 수정 사항: 'delta_apply'뿐만 아니라 'package' 작업까지 감시 대상에 포함
-        relevant_jobs = [j for j in jobs if j.get('status') == 'finished' and j.get('type') in ['delta_apply', 'package']]
+        # 성공한 delta_apply 작업들 추출
+        delta_jobs = [j for j in jobs if j.get('type') == 'delta_apply' and j.get('status') == 'finished']
+        if not delta_jobs: return "NO_JOB"
         
-        if not relevant_jobs: return "NO_JOB"
-        
-        # 🔥 수정 사항: max 함수를 사용하여 가장 최근에 완료된 작업 하나를 추출
-        latest = max(relevant_jobs, key=lambda j: j.get('finished_at', ''))
-        
-        # 🔥 수정 사항: 캐시 키에 작업 타입(type)을 추가하여 구분이 더 명확하게 함
-        return f"{latest['id']}_{latest['finished_at']}_{latest['type']}"
+        # 최신 Job의 ID와 완료 시간을 조합하여 고유 키 생성
+        delta_jobs.sort(key=lambda j: j.get('finished_at', ''), reverse=True)
+        latest = delta_jobs[0]
+        # ID와 시간을 합쳐서 캐시 키로 리턴 (ID는 같아도 시간이 다르면 재동기화)
+        return f"{latest['id']}_{latest['finished_at']}"
     except:
         return "JOB_CHECK_ERROR"
 
