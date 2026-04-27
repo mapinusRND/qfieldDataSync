@@ -418,91 +418,62 @@ def process_gpkg_to_db(project_id, project_path, project_name, owner):
 
 
 def update_unified_view():
+    """
+    분산되어 적재된 여러 사용자의 개별 테이블들을 '재난 타입별'로 하나로 묶어줍니다.
+    dashboard나 GIS 클라이언트에서 조회하기 편하도록 'rain_v_qfield_data' 같은 이름의 VIEW를 생성합니다.
+    동일한 컬럼 구조를 가진 테이블들을 'UNION ALL'로 결합하는 SQL을 동적으로 생성하여 실행합니다.
+    """
     print(f"    📊 [개별 뷰 갱신 시작]")
     conn = None
     try:
         conn = get_pg_conn()
-        # ✅ autocommit 모드: DDL(CREATE VIEW)은 트랜잭션 블록 밖에서 실행해야 락 최소화
-        conn.autocommit = True
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-
-        cur.execute(f"""
-            SELECT DISTINCT qfield_type 
-            FROM {TARGET_SCHEMA}.qfield_data_manage 
-            WHERE qfield_type IS NOT NULL
-        """)
+        
+        # 현재 DB에 관리 중인 재난 타입(예: rain, fire) 종류 조회
+        cur.execute(f"SELECT DISTINCT qfield_type FROM {TARGET_SCHEMA}.qfield_data_manage WHERE qfield_type IS NOT NULL")
         types = [r['qfield_type'] for r in cur.fetchall()]
 
-        if not types:
-            return
+        if not types: return
 
         for q_type in types:
-            cur.execute(f"""
-                SELECT id, name, gpkg_name, table_name 
-                FROM {TARGET_SCHEMA}.qfield_data_manage 
-                WHERE qfield_type = %s
-            """, (q_type,))
+            # 해당 타입에 속하는 모든 물리 테이블 리스트 조회
+            cur.execute(f"SELECT id, name, gpkg_name, table_name FROM {TARGET_SCHEMA}.qfield_data_manage WHERE qfield_type = %s", (q_type,))
             rows = cur.fetchall()
-
+            
             view_parts = []
             for r in rows:
                 t_name = r['table_name']
-
-                cur.execute(f"""
-                    SELECT EXISTS (
-                        SELECT 1 FROM information_schema.tables 
-                        WHERE table_schema = %s AND table_name = %s
+                # 실제 DB에 해당 테이블이 물리적으로 존재하는지 최종 확인
+                cur.execute(f"SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = '{TARGET_SCHEMA}' AND table_name = %s)", (t_name,))
+                if cur.fetchone()[0]:
+                    # UNION 연산을 위해 컬럼 순서를 일정하게 맞추어 SELECT 문구 생성
+                    cur.execute(f"SELECT column_name FROM information_schema.columns WHERE table_schema = '{TARGET_SCHEMA}' AND table_name = %s AND column_name != 'seq' ORDER BY ordinal_position", (t_name,))
+                    columns = [f'd."{col[0]}"' for col in cur.fetchall()]
+                    column_string = ", ".join(columns)
+                    
+                    part = (
+                        f"SELECT '{r['id']}'::text as manage_id, '{r['name']}'::text as project_name, "
+                        f"'{r['gpkg_name']}'::text as source_gpkg, '{t_name}'::text as source_table, "
+                        f"'{q_type}'::text as qfield_type, {column_string} "
+                        f"FROM {TARGET_SCHEMA}.\"{t_name}\" d"
                     )
-                """, (TARGET_SCHEMA, t_name))
-                if not cur.fetchone()[0]:
-                    continue
+                    view_parts.append(part)
 
-                cur.execute(f"""
-                    SELECT column_name 
-                    FROM information_schema.columns 
-                    WHERE table_schema = %s AND table_name = %s AND column_name != 'seq'
-                    ORDER BY ordinal_position
-                """, (TARGET_SCHEMA, t_name))
-                columns = [f'd."{col[0]}"' for col in cur.fetchall()]
-                column_string = ", ".join(columns)
-
-                part = (
-                    f"SELECT '{r['id']}'::text as manage_id, "
-                    f"'{r['name']}'::text as project_name, "
-                    f"'{r['gpkg_name']}'::text as source_gpkg, "
-                    f"'{t_name}'::text as source_table, "
-                    f"'{q_type}'::text as qfield_type, {column_string} "
-                    f"FROM {TARGET_SCHEMA}.\"{t_name}\" d"
-                )
-                view_parts.append(part)
-
+            # 수집된 SELECT 문들을 UNION ALL로 엮어서 하나의 VIEW로 통합 생성
             if view_parts:
                 specific_view_name = f"{q_type}_v_qfield_data"
-                # ✅ 기존 뷰를 먼저 제거 후 재생성 — REPLACE가 락 잡는 경우 방어
-                try:
-                    cur.execute(f"DROP VIEW IF EXISTS {TARGET_SCHEMA}.{specific_view_name}")
-                except Exception as drop_err:
-                    print(f"      ⚠️ 뷰 DROP 실패 (무시): {drop_err}")
+                create_view_sql = f"CREATE OR REPLACE VIEW {TARGET_SCHEMA}.{specific_view_name} AS " + " UNION ALL ".join(view_parts)
+                cur.execute(create_view_sql)
+                print(f"      ✅ 뷰 생성 완료: {TARGET_SCHEMA}.{specific_view_name}")
 
-                create_view_sql = (
-                    f"CREATE VIEW {TARGET_SCHEMA}.{specific_view_name} AS "
-                    + " UNION ALL ".join(view_parts)
-                )
-                try:
-                    cur.execute(create_view_sql)
-                    print(f"      ✅ 뷰 생성 완료: {TARGET_SCHEMA}.{specific_view_name}")
-                except Exception as view_err:
-                    print(f"      ❌ 뷰 생성 실패: {specific_view_name} → {view_err}")
-
+        conn.commit()
     except Exception as e:
-        print(f"      ⚠️ 뷰 갱신 오류: {e}")
+        if conn: conn.rollback()
+        print(f"      ⚠️ 뷰 생성 오류: {e}")
     finally:
-        # ✅ autocommit 모드라 rollback 불필요, 커넥션만 안전하게 닫기
-        try:
-            if conn:
-                conn.close()
-        except Exception:
-            pass
+        if conn:
+            cur.close()
+            conn.close()
 
 
 def sync_single_project(project_data):
