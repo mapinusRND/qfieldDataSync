@@ -559,31 +559,22 @@ def sync_single_project(project_data):
 
 
 def get_latest_job_id(project_id):
+    """
+    사용자가 모바일 기기에서 QField 데이터를 서버로 'Push' 했을 때 생성되는
+    'delta_apply'(변경사항 적용) 작업의 최신 ID를 조회합니다.
+    성공적으로 끝난(finished) 작업의 ID가 이전과 달라졌다면, 새로운 데이터가 업로드된 것으로 판단합니다.
+    """
     global client
     try:
-        if not client:
-            client = login_client()
-
+        if not client: client = login_client()
         jobs = client.list_jobs(project_id)
-
-        delta_jobs = [
-            j for j in jobs
-            if j.get('type') == 'delta_apply'
-            and j.get('status') == 'finished'
-        ]
-
-        if not delta_jobs:
-            return "NO_JOB"
-
-        # 🔥 핵심: finished_at 기준 정렬
-        delta_jobs.sort(key=lambda j: j.get('finished_at', ''), reverse=True)
-
-        latest = delta_jobs[0]
-
-        # 🔥 핵심: id + finished_at 같이 반환
-        return f"{latest['id']}_{latest.get('finished_at')}"
-
-    except Exception as e:
+        # delta_apply 타입 중 성공한 작업들만 필터링
+        delta_jobs = [j for j in jobs if j.get('type') == 'delta_apply' and j.get('status') == 'finished']
+        if not delta_jobs: return "NO_JOB"
+        # 생성 시간 순으로 정렬하여 가장 최근 것 선택
+        delta_jobs.sort(key=lambda j: j.get('created_at', ''), reverse=True)
+        return delta_jobs[0]['id']
+    except:
         return "JOB_CHECK_ERROR"
 
 
@@ -685,8 +676,7 @@ while True:
             
             # 2. 각 프로젝트별로 최신 성공 작업 ID 조회
             current_job_id = get_latest_job_id(p_id)
-            print(f"    🧪 JOB CHECK: {p_id} | current={current_job_id} | last={last_jobs_cache.get(p_id)}")
-            
+
             # 3. 변경 감지 조건:
             # - 캐시에 정보가 없거나 (처음 실행)
             # - 로컬에 파일이 없거나 (실수로 삭제된 경우)
