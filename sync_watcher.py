@@ -51,8 +51,6 @@ else:
 
 TARGET_SCHEMA = "qfield"         # 215 DB 내에서 분석 완료된 데이터를 관리할 전용 스키마 명칭
 CHECK_INTERVAL = 30              # 새로운 데이터(Job)가 있는지 체크하는 루프 주기 (초 단위)
-PROJECT_API_INTERVAL = 3   # ✅ 추가: 프로젝트 간 API 호출 간격 (초)
-PROJECT_SYNC_INTERVAL = 5  # ✅ 추가: 동기화 작업 후 추가 대기 (초)
 
 # [기준 정보 테이블] 215 서버의 disaster.qfield_info 테이블:
 # 수집된 데이터가 '화재', '침수' 등 어떤 타입인지 컬럼 구성을 통해 판별하기 위한 딕셔너리형 기준 정보
@@ -420,29 +418,39 @@ def process_gpkg_to_db(project_id, project_path, project_name, owner):
 
 
 def update_unified_view():
+    """
+    분산되어 적재된 여러 사용자의 개별 테이블들을 '재난 타입별'로 하나로 묶어줍니다.
+    dashboard나 GIS 클라이언트에서 조회하기 편하도록 'rain_v_qfield_data' 같은 이름의 VIEW를 생성합니다.
+    동일한 컬럼 구조를 가진 테이블들을 'UNION ALL'로 결합하는 SQL을 동적으로 생성하여 실행합니다.
+    """
     print(f"    📊 [개별 뷰 갱신 시작]")
     conn = None
     try:
         conn = get_pg_conn()
-        conn.autocommit = True  # ✅ DDL 락 방지
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
         
+        # 현재 DB에 관리 중인 재난 타입(예: rain, fire) 종류 조회
         cur.execute(f"SELECT DISTINCT qfield_type FROM {TARGET_SCHEMA}.qfield_data_manage WHERE qfield_type IS NOT NULL")
         types = [r['qfield_type'] for r in cur.fetchall()]
+
         if not types: return
 
         for q_type in types:
+            # 해당 타입에 속하는 모든 물리 테이블 리스트 조회
             cur.execute(f"SELECT id, name, gpkg_name, table_name FROM {TARGET_SCHEMA}.qfield_data_manage WHERE qfield_type = %s", (q_type,))
             rows = cur.fetchall()
             
             view_parts = []
             for r in rows:
                 t_name = r['table_name']
+                # 실제 DB에 해당 테이블이 물리적으로 존재하는지 최종 확인
                 cur.execute(f"SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = '{TARGET_SCHEMA}' AND table_name = %s)", (t_name,))
                 if cur.fetchone()[0]:
+                    # UNION 연산을 위해 컬럼 순서를 일정하게 맞추어 SELECT 문구 생성
                     cur.execute(f"SELECT column_name FROM information_schema.columns WHERE table_schema = '{TARGET_SCHEMA}' AND table_name = %s AND column_name != 'seq' ORDER BY ordinal_position", (t_name,))
                     columns = [f'd."{col[0]}"' for col in cur.fetchall()]
                     column_string = ", ".join(columns)
+                    
                     part = (
                         f"SELECT '{r['id']}'::text as manage_id, '{r['name']}'::text as project_name, "
                         f"'{r['gpkg_name']}'::text as source_gpkg, '{t_name}'::text as source_table, "
@@ -451,27 +459,21 @@ def update_unified_view():
                     )
                     view_parts.append(part)
 
+            # 수집된 SELECT 문들을 UNION ALL로 엮어서 하나의 VIEW로 통합 생성
             if view_parts:
                 specific_view_name = f"{q_type}_v_qfield_data"
-                try:
-                    # ✅ REPLACE 대신 DROP → CREATE로 락 회피
-                    cur.execute(f"DROP VIEW IF EXISTS {TARGET_SCHEMA}.{specific_view_name}")
-                except Exception as drop_err:
-                    print(f"      ⚠️ 뷰 DROP 실패: {drop_err}")
-                try:
-                    create_view_sql = f"CREATE VIEW {TARGET_SCHEMA}.{specific_view_name} AS " + " UNION ALL ".join(view_parts)
-                    cur.execute(create_view_sql)
-                    print(f"      ✅ 뷰 생성 완료: {TARGET_SCHEMA}.{specific_view_name}")
-                except Exception as view_err:
-                    print(f"      ❌ 뷰 생성 실패: {specific_view_name} → {view_err}")
+                create_view_sql = f"CREATE OR REPLACE VIEW {TARGET_SCHEMA}.{specific_view_name} AS " + " UNION ALL ".join(view_parts)
+                cur.execute(create_view_sql)
+                print(f"      ✅ 뷰 생성 완료: {TARGET_SCHEMA}.{specific_view_name}")
 
+        conn.commit()
     except Exception as e:
-        print(f"      ⚠️ 뷰 갱신 오류: {e}")
+        if conn: conn.rollback()
+        print(f"      ⚠️ 뷰 생성 오류: {e}")
     finally:
-        try:
-            if conn: conn.close()
-        except Exception:
-            pass
+        if conn:
+            cur.close()
+            conn.close()
 
 
 def sync_single_project(project_data):
@@ -528,22 +530,22 @@ def sync_single_project(project_data):
 
 
 def get_latest_job_id(project_id):
+    """
+    사용자가 모바일 기기에서 QField 데이터를 서버로 'Push' 했을 때 생성되는
+    'delta_apply'(변경사항 적용) 작업의 최신 ID를 조회합니다.
+    성공적으로 끝난(finished) 작업의 ID가 이전과 달라졌다면, 새로운 데이터가 업로드된 것으로 판단합니다.
+    """
     global client
     try:
         if not client: client = login_client()
         jobs = client.list_jobs(project_id)
+        # delta_apply 타입 중 성공한 작업들만 필터링
         delta_jobs = [j for j in jobs if j.get('type') == 'delta_apply' and j.get('status') == 'finished']
         if not delta_jobs: return "NO_JOB"
+        # 생성 시간 순으로 정렬하여 가장 최근 것 선택
         delta_jobs.sort(key=lambda j: j.get('created_at', ''), reverse=True)
         return delta_jobs[0]['id']
-    except Exception as e:
-        err_str = str(e)
-        if "404" in err_str or "Not Found" in err_str:
-            print(f"    ⚠️ [404] project_id={project_id} QFieldCloud에 없는 프로젝트")
-            return "PROJECT_NOT_FOUND"
-        if "401" in err_str or "Unauthorized" in err_str:
-            print(f"    🔄 [401] 세션 만료 → 재로그인")
-            client = login_client()
+    except:
         return "JOB_CHECK_ERROR"
 
 
@@ -570,67 +572,38 @@ def get_all_projects_from_db():
 
 # ========== 메인 실행 루프 (Infinite Loop) ==========
 # 30초 간격으로 무한 반복하며 QFieldCloud의 모든 프로젝트를 감시합니다.
-last_jobs_cache = {}
-skip_project_ids = set()  # ✅ 404 영구 스킵 목록
-
+last_jobs_cache = {} # 메모리 상에서 프로젝트별로 처리 완료된 최신 Job ID를 기억함
 print(f"[{datetime.now()}] 🚀 실시간 동기화 엔진 가동 중...")
 
 while True:
     try:
+        # 1. 212 DB를 통해 현재 운영 중인 모든 프로젝트 목록 확보
         current_projects = get_all_projects_from_db()
-
         for p in current_projects:
             p_id = p['id']
             project_path = os.path.join(BASE_OUTPUT_DIR, p_id)
-
-            # ✅ 404 확인된 프로젝트 완전 스킵
-            if p_id in skip_project_ids:
-                continue
-
+            
+            # 2. 각 프로젝트별로 최신 성공 작업 ID 조회
             current_job_id = get_latest_job_id(p_id)
 
-            # ✅ 404 → 영구 스킵 등록
-            if current_job_id == "PROJECT_NOT_FOUND":
-                skip_project_ids.add(p_id)
-                last_jobs_cache[p_id] = "PROJECT_NOT_FOUND"
-                print(f"    🚫 [영구 스킵] {p['name']} ({p_id})")
-                time.sleep(PROJECT_API_INTERVAL)
-                continue
-
-            # ✅ 일시 오류 → 이번 루프 스킵, 다음 루프 재시도
-            if current_job_id == "JOB_CHECK_ERROR":
-                print(f"    ⏩ [일시 오류 스킵] {p['name']}")
-                time.sleep(PROJECT_API_INTERVAL)
-                continue
-
-            needs_sync = (
-                p_id not in last_jobs_cache
-                or not os.path.exists(project_path)
-                or current_job_id != last_jobs_cache[p_id]
-            )
-
-            if needs_sync:
+            # 3. 변경 감지 조건:
+            # - 캐시에 정보가 없거나 (처음 실행)
+            # - 로컬에 파일이 없거나 (실수로 삭제된 경우)
+            # - 서버의 Job ID가 이전과 다를 때 (사용자가 기기에서 업로드 완료 시)
+            if p_id not in last_jobs_cache or not os.path.exists(project_path) or current_job_id != last_jobs_cache[p_id]:
                 print(f"[{datetime.now()}] 🔄 변경 감지: {p['name']} (소유자: {p['owner']})")
-                try:
-                    sync_single_project(p)
-                except Exception as sync_err:
-                    if "404" in str(sync_err) or "Not Found" in str(sync_err):
-                        skip_project_ids.add(p_id)
-                        print(f"    🚫 [sync 404 스킵] {p['name']}")
-                    else:
-                        print(f"    ❌ [sync 오류] {p['name']}: {sync_err}")
-
+                
+                # 실질적인 동기화 및 DB 적재 수행
+                sync_single_project(p)
+                
+                # 처리 완료된 Job ID를 캐시에 저장하여 중복 실행 방지
                 last_jobs_cache[p_id] = current_job_id
-                # ✅ 동기화 후 추가 대기 (서버 부하 분산)
-                time.sleep(PROJECT_SYNC_INTERVAL)
-            else:
-                # ✅ 변경 없는 프로젝트도 간격 유지
-                time.sleep(PROJECT_API_INTERVAL)
 
     except Exception as e:
         print(f"⚠️ 루프 에러: {e}")
         time.sleep(5)
-        client = login_client()
+        client = login_client() # 치명적 에러 발생 시 세션 재로그인 시도
 
-    print(f"[{datetime.now()}] 💤 대기중... ({CHECK_INTERVAL}초) | 스킵: {len(skip_project_ids)}개")
+    # 과도한 API 호출 방지를 위해 지정된 주기(30초)만큼 대기
+    print(f"[{datetime.now()}] 💤 대기중... ({CHECK_INTERVAL}초)")
     time.sleep(CHECK_INTERVAL)
