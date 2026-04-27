@@ -530,21 +530,19 @@ def sync_single_project(project_data):
 
 
 def get_latest_job_id(project_id):
-    """
-    사용자가 모바일 기기에서 QField 데이터를 서버로 'Push' 했을 때 생성되는
-    'delta_apply'(변경사항 적용) 작업의 최신 ID를 조회합니다.
-    성공적으로 끝난(finished) 작업의 ID가 이전과 달라졌다면, 새로운 데이터가 업로드된 것으로 판단합니다.
-    """
     global client
     try:
         if not client: client = login_client()
         jobs = client.list_jobs(project_id)
-        # delta_apply 타입 중 성공한 작업들만 필터링
+        # 성공한 delta_apply 작업들 추출
         delta_jobs = [j for j in jobs if j.get('type') == 'delta_apply' and j.get('status') == 'finished']
         if not delta_jobs: return "NO_JOB"
-        # 생성 시간 순으로 정렬하여 가장 최근 것 선택
-        delta_jobs.sort(key=lambda j: j.get('created_at', ''), reverse=True)
-        return delta_jobs[0]['id']
+        
+        # 최신 Job의 ID와 완료 시간을 조합하여 고유 키 생성
+        delta_jobs.sort(key=lambda j: j.get('finished_at', ''), reverse=True)
+        latest = delta_jobs[0]
+        # ID와 시간을 합쳐서 캐시 키로 리턴 (ID는 같아도 시간이 다르면 재동기화)
+        return f"{latest['id']}_{latest['finished_at']}"
     except:
         return "JOB_CHECK_ERROR"
 
@@ -570,40 +568,61 @@ def get_all_projects_from_db():
     return projects
 
 
-# ========== 메인 실행 루프 (Infinite Loop) ==========
 # 30초 간격으로 무한 반복하며 QFieldCloud의 모든 프로젝트를 감시합니다.
-last_jobs_cache = {} # 메모리 상에서 프로젝트별로 처리 완료된 최신 Job ID를 기억함
-print(f"[{datetime.now()}] 🚀 실시간 동기화 엔진 가동 중...")
+# ========== 메인 실행 루프 (안정성 및 삭제 로직 강화) ==========
+last_jobs_cache = {} 
+print(f"[{datetime.now()}] 🚀 실시간 동기화 엔진 가동 중...", flush=True)
 
 while True:
     try:
-        # 1. 212 DB를 통해 현재 운영 중인 모든 프로젝트 목록 확보
+        # 1. 운영 DB(212)에서 현재 존재하는 모든 프로젝트 목록 확보
         current_projects = get_all_projects_from_db()
+        current_project_ids = [p['id'] for p in current_projects]
+        
+        ghost_found = False
+
+        # 2. 🔥 [핵심 추가] 유령 데이터 클리닝 (삭제된 프로젝트 처리)
+        if current_project_ids:
+            # SQL IN 문법 대응
+            id_params_str = str(tuple(current_project_ids)) if len(current_project_ids) > 1 else f"('{current_project_ids[0]}')"
+
+            with db_engine.begin() as conn:
+                # 운영 DB 리스트에 없는 ID를 가진 관리 이력 조회
+                ghost_tables_res = conn.execute(text(f"""
+                    SELECT table_name, id, name FROM {TARGET_SCHEMA}.qfield_data_manage 
+                    WHERE id NOT IN {id_params_str}
+                """))
+                
+                ghost_list = ghost_tables_res.fetchall()
+                if ghost_list:
+                    print(f"[{datetime.now()}] 🧹 삭제된 프로젝트 감지: {len(ghost_list)}개를 정리합니다.")
+                    for row in ghost_list:
+                        t_name, p_id, p_name = row[0], row[1], row[2]
+                        # 물리 테이블 삭제 (CASCADE로 뷰 의존성 자동 해제)
+                        conn.execute(text(f'DROP TABLE IF EXISTS {TARGET_SCHEMA}."{t_name}" CASCADE'))
+                        # 관리 이력 삭제
+                        conn.execute(text(f"DELETE FROM {TARGET_SCHEMA}.qfield_data_manage WHERE id = :pid"), {"pid": p_id})
+                        print(f"    🗑️ 제거 완료: {p_name} ({p_id})")
+                    ghost_found = True
+
+        # 삭제된 게 있다면 통합 뷰도 즉시 갱신
+        if ghost_found:
+            update_unified_view()
+
+        # 3. 실재하는 프로젝트들 대상 동기화 진행
         for p in current_projects:
             p_id = p['id']
             project_path = os.path.join(BASE_OUTPUT_DIR, p_id)
-            
-            # 2. 각 프로젝트별로 최신 성공 작업 ID 조회
             current_job_id = get_latest_job_id(p_id)
 
-            # 3. 변경 감지 조건:
-            # - 캐시에 정보가 없거나 (처음 실행)
-            # - 로컬에 파일이 없거나 (실수로 삭제된 경우)
-            # - 서버의 Job ID가 이전과 다를 때 (사용자가 기기에서 업로드 완료 시)
             if p_id not in last_jobs_cache or not os.path.exists(project_path) or current_job_id != last_jobs_cache[p_id]:
-                print(f"[{datetime.now()}] 🔄 변경 감지: {p['name']} (소유자: {p['owner']})")
-                
-                # 실질적인 동기화 및 DB 적재 수행
+                print(f"[{datetime.now()}] 🔄 변경/업데이트 감지: {p['name']}")
                 sync_single_project(p)
-                
-                # 처리 완료된 Job ID를 캐시에 저장하여 중복 실행 방지
                 last_jobs_cache[p_id] = current_job_id
 
     except Exception as e:
-        print(f"⚠️ 루프 에러: {e}")
+        print(f"⚠️ 루프 에러 발생: {e}", flush=True)
         time.sleep(5)
-        client = login_client() # 치명적 에러 발생 시 세션 재로그인 시도
+        client = login_client()
 
-    # 과도한 API 호출 방지를 위해 지정된 주기(30초)만큼 대기
-    print(f"[{datetime.now()}] 💤 대기중... ({CHECK_INTERVAL}초)")
     time.sleep(CHECK_INTERVAL)
