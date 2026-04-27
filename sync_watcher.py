@@ -647,11 +647,6 @@ while True:
                 print(f"    🚫 [영구 스킵] {p['name']}")
                 continue
 
-            # ✅ JOB_CHECK_ERROR는 continue 하지 않고 그냥 통과
-            # → needs_sync 조건에서 캐시에 없으면 동기화 시도
-            if current_job_id == "JOB_CHECK_ERROR":
-                current_job_id = "NO_JOB"  # ← NO_JOB으로 대체해서 동기화 흐름 유지
-
             needs_sync = (
                 p_id not in last_jobs_cache
                 or not os.path.exists(project_path)
