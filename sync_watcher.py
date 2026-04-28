@@ -559,32 +559,72 @@ def sync_single_project(project_data):
 
 
 def get_latest_job_id(project_id):
-    global client
+    """
+    212 DB의 core_job 테이블에서 delta_apply 완료 시각을 직접 조회
+    """
+    conn = None
     try:
-        if not client:
-            client = login_client()
+        conn = get_qfc_db_conn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
-        jobs = client.list_jobs(project_id)
+        # ✅ delta_apply job finished_at 직접 조회
+        cur.execute("""
+            SELECT id, finished_at
+            FROM public.core_job
+            WHERE project_id = %s::uuid
+              AND type = 'delta_apply'
+              AND status = 'finished'
+            ORDER BY finished_at DESC
+            LIMIT 1
+        """, (project_id,))
 
-        delta_jobs = [
-            j for j in jobs
-            if j.get('type') == 'delta_apply'
-            and j.get('status') == 'finished'
-        ]
+        job_row = cur.fetchone()
 
-        if not delta_jobs:
+        if job_row and job_row['finished_at']:
+            return f"delta_{str(job_row['id'])}_{str(job_row['finished_at'])}"
+
+        # ✅ delta_apply job 없으면 data_last_updated_at 폴백
+        cur.execute("""
+            SELECT id, data_last_updated_at
+            FROM public.core_project
+            WHERE id = %s::uuid
+        """, (project_id,))
+
+        proj_row = cur.fetchone()
+        if not proj_row:
+            return "PROJECT_NOT_FOUND"
+        if not proj_row['data_last_updated_at']:
             return "NO_JOB"
 
-        # 🔥 핵심: finished_at 기준 정렬
-        delta_jobs.sort(key=lambda j: j.get('finished_at', ''), reverse=True)
-
-        latest = delta_jobs[0]
-
-        # 🔥 핵심: id + finished_at 같이 반환
-        return f"{latest['id']}_{latest.get('finished_at')}"
+        return f"proj_{str(proj_row['data_last_updated_at'])}"
 
     except Exception as e:
+        err = str(e)
+        # uuid 캐스팅 오류 시 캐스팅 없이 재시도
+        if "invalid input syntax" in err or "uuid" in err:
+            try:
+                conn2 = get_qfc_db_conn()
+                cur2 = conn2.cursor(cursor_factory=psycopg2.extras.DictCursor)
+                cur2.execute("""
+                    SELECT id, finished_at FROM public.core_job
+                    WHERE project_id::text = %s
+                      AND type = 'delta_apply' AND status = 'finished'
+                    ORDER BY finished_at DESC LIMIT 1
+                """, (project_id,))
+                row = cur2.fetchone()
+                conn2.close()
+                if row and row['finished_at']:
+                    return f"delta_{str(row['id'])}_{str(row['finished_at'])}"
+                return "NO_JOB"
+            except:
+                pass
+        print(f"    ⚠️ [Job DB 조회 오류] {project_id}: {e}")
         return "JOB_CHECK_ERROR"
+    finally:
+        if conn:
+            conn.close()
+        if conn:
+            conn.close()
 
 
 def get_all_projects_from_db():
@@ -674,37 +714,40 @@ print(f"[{datetime.now()}] 🚀 실시간 동기화 엔진 가동 중...")
 
 while True:
     try:
-        # 1. 212 DB를 통해 현재 운영 중인 모든 프로젝트 목록 확보
         current_projects = get_all_projects_from_db()
-
         current_project_ids = [p['id'] for p in current_projects]
-        cleanup_deleted_projects(current_project_ids);
+        cleanup_deleted_projects(current_project_ids)
+
         for p in current_projects:
             p_id = p['id']
             project_path = os.path.join(BASE_OUTPUT_DIR, p_id)
-            
-            # 2. 각 프로젝트별로 최신 성공 작업 ID 조회
+
             current_job_id = get_latest_job_id(p_id)
-            print(f"    🧪 JOB CHECK: {p_id} | current={current_job_id} | last={last_jobs_cache.get(p_id)}")
-            
-            # 3. 변경 감지 조건:
-            # - 캐시에 정보가 없거나 (처음 실행)
-            # - 로컬에 파일이 없거나 (실수로 삭제된 경우)
-            # - 서버의 Job ID가 이전과 다를 때 (사용자가 기기에서 업로드 완료 시)
-            if p_id not in last_jobs_cache or not os.path.exists(project_path) or current_job_id != last_jobs_cache[p_id]:
+
+            # ✅ DB에 없는 프로젝트 스킵
+            if current_job_id == "PROJECT_NOT_FOUND":
+                print(f"    ⚠️ [스킵] {p['name']} - DB에 없는 프로젝트")
+                continue
+
+            # ✅ 일시적 오류 스킵 (다음 루프 재시도)
+            if current_job_id == "JOB_CHECK_ERROR":
+                continue
+
+            needs_sync = (
+                p_id not in last_jobs_cache
+                or not os.path.exists(project_path)
+                or current_job_id != last_jobs_cache[p_id]
+            )
+
+            if needs_sync:
                 print(f"[{datetime.now()}] 🔄 변경 감지: {p['name']} (소유자: {p['owner']})")
-                
-                # 실질적인 동기화 및 DB 적재 수행
                 sync_single_project(p)
-                
-                # 처리 완료된 Job ID를 캐시에 저장하여 중복 실행 방지
                 last_jobs_cache[p_id] = current_job_id
 
     except Exception as e:
         print(f"⚠️ 루프 에러: {e}")
         time.sleep(5)
-        client = login_client() # 치명적 에러 발생 시 세션 재로그인 시도
+        client = login_client()
 
-    # 과도한 API 호출 방지를 위해 지정된 주기(30초)만큼 대기
     print(f"[{datetime.now()}] 💤 대기중... ({CHECK_INTERVAL}초)")
     time.sleep(CHECK_INTERVAL)

@@ -560,36 +560,69 @@ def sync_single_project(project_data):
 
 def get_latest_job_id(project_id):
     """
-    API 대신 212 DB를 직접 조회 → 도커/로컬 환경 관계없이 동일하게 동작
+    212 DB의 core_job 테이블에서 delta_apply 완료 시각을 직접 조회
     """
     conn = None
     try:
         conn = get_qfc_db_conn()
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
-        # ✅ data_last_updated_at: 프로젝트 데이터가 마지막으로 업데이트된 시간
-        # QField 앱에서 Push 할 때마다 이 값이 갱신됨
+        # ✅ delta_apply job finished_at 직접 조회
+        cur.execute("""
+            SELECT id, finished_at
+            FROM public.core_job
+            WHERE project_id = %s::uuid
+              AND type = 'delta_apply'
+              AND status = 'finished'
+            ORDER BY finished_at DESC
+            LIMIT 1
+        """, (project_id,))
+
+        job_row = cur.fetchone()
+
+        if job_row and job_row['finished_at']:
+            return f"delta_{str(job_row['id'])}_{str(job_row['finished_at'])}"
+
+        # ✅ delta_apply job 없으면 data_last_updated_at 폴백
         cur.execute("""
             SELECT id, data_last_updated_at
             FROM public.core_project
-            WHERE id = %s
+            WHERE id = %s::uuid
         """, (project_id,))
 
-        row = cur.fetchone()
-        if not row:
+        proj_row = cur.fetchone()
+        if not proj_row:
             return "PROJECT_NOT_FOUND"
-
-        updated_at = row['data_last_updated_at']
-        if not updated_at:
+        if not proj_row['data_last_updated_at']:
             return "NO_JOB"
 
-        # ✅ id + updated_at 조합으로 변경 감지 키 생성
-        return f"{str(row['id'])}_{str(updated_at)}"
+        return f"proj_{str(proj_row['data_last_updated_at'])}"
 
     except Exception as e:
+        err = str(e)
+        # uuid 캐스팅 오류 시 캐스팅 없이 재시도
+        if "invalid input syntax" in err or "uuid" in err:
+            try:
+                conn2 = get_qfc_db_conn()
+                cur2 = conn2.cursor(cursor_factory=psycopg2.extras.DictCursor)
+                cur2.execute("""
+                    SELECT id, finished_at FROM public.core_job
+                    WHERE project_id::text = %s
+                      AND type = 'delta_apply' AND status = 'finished'
+                    ORDER BY finished_at DESC LIMIT 1
+                """, (project_id,))
+                row = cur2.fetchone()
+                conn2.close()
+                if row and row['finished_at']:
+                    return f"delta_{str(row['id'])}_{str(row['finished_at'])}"
+                return "NO_JOB"
+            except:
+                pass
         print(f"    ⚠️ [Job DB 조회 오류] {project_id}: {e}")
         return "JOB_CHECK_ERROR"
     finally:
+        if conn:
+            conn.close()
         if conn:
             conn.close()
 
