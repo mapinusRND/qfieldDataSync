@@ -231,7 +231,7 @@ def save_gdf_direct(gdf, table_name, schema, project_path, owner_name, allowed_c
         col_defs = ['seq SERIAL PRIMARY KEY', 'platform_type SMALLINT DEFAULT 1']
         for col in final_cols:
             col_defs.append(f'"{col}" TEXT')
-
+        col_defs.append("use_yn CHAR(1) DEFAULT 'y'")          # ✅ geometry 앞에 삽입
         if is_geo:
             col_defs.append(f'"{geom_col}" GEOMETRY(Geometry, 3857)')
 
@@ -241,7 +241,7 @@ def save_gdf_direct(gdf, table_name, schema, project_path, owner_name, allowed_c
         # === 🔥 AUDIO 캐시 생성 (중요) ===
         audio_cache = build_audio_cache(project_path)
 
-        insert_cols = ['platform_type'] + final_cols
+        insert_cols = ['platform_type'] + final_cols + ['use_yn']   # ✅ use_yn 추가
         if is_geo:
             insert_cols.append(geom_col)
 
@@ -258,10 +258,9 @@ def save_gdf_direct(gdf, table_name, schema, project_path, owner_name, allowed_c
         # === 🔥 batch 데이터 생성 ===
         batch_data = []
 
-        for row in gdf.itertuples(index=False):  # 🔥 iterrows 제거
+        for row in gdf.itertuples(index=False):
             row_dict = row._asdict()
             values = [1]
-
             for col in final_cols:
                 if col.endswith('_txt'):
                     origin = col[:-4]
@@ -282,10 +281,10 @@ def save_gdf_direct(gdf, table_name, schema, project_path, owner_name, allowed_c
                     val = row_dict.get(col)
                     values.append(None if pd.isna(val) else val)
 
+            values.append('y')                                       # ✅ use_yn = 'y' (신규 등록)
             if is_geo:
                 geom = row_dict.get(geom_col)
                 values.append(wkb_dumps(geom, hex=True, srid=3857) if geom else None)
-
             batch_data.append(values)
 
         # === 🔥 핵심: batch insert ===
@@ -418,11 +417,10 @@ def process_gpkg_to_db(project_id, project_path, project_name, owner):
 
 
 def update_unified_view():
-    print(f"    📊 [개별 뷰 갱신 시작]")
+    print(f"    📊 [개별 뷰 갱신 시작 (순번 생성 로직 적용)]")
     conn = None
     try:
         conn = get_pg_conn()
-        # ✅ autocommit 모드: DDL(CREATE VIEW)은 트랜잭션 블록 밖에서 실행해야 락 최소화
         conn.autocommit = True
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
@@ -438,15 +436,19 @@ def update_unified_view():
 
         for q_type in types:
             cur.execute(f"""
-                SELECT id, name, gpkg_name, table_name 
+                SELECT id, name, gpkg_name, table_name, reg_date
                 FROM {TARGET_SCHEMA}.qfield_data_manage 
                 WHERE qfield_type = %s
+                ORDER BY reg_date ASC
             """, (q_type,))
             rows = cur.fetchall()
 
             view_parts = []
+            all_data_cols = []
+
             for r in rows:
                 t_name = r['table_name']
+                reg_date_val = str(r['reg_date']) if r['reg_date'] else '1970-01-01'
 
                 cur.execute(f"""
                     SELECT EXISTS (
@@ -457,38 +459,74 @@ def update_unified_view():
                 if not cur.fetchone()[0]:
                     continue
 
+                # ✅ geometry 컬럼명 확인
+                cur.execute(f"""
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = %s AND table_name = %s
+                      AND udt_name = 'geometry'
+                    LIMIT 1
+                """, (TARGET_SCHEMA, t_name))
+                geom_row = cur.fetchone()
+                geom_col_name = geom_row[0] if geom_row else None
+
+                # ✅ seq, geometry 제외한 일반 컬럼 조회
                 cur.execute(f"""
                     SELECT column_name 
                     FROM information_schema.columns 
-                    WHERE table_schema = %s AND table_name = %s AND column_name != 'seq'
+                    WHERE table_schema = %s AND table_name = %s
+                      AND column_name != 'seq'
+                      AND udt_name != 'geometry'
                     ORDER BY ordinal_position
                 """, (TARGET_SCHEMA, t_name))
-                columns = [f'd."{col[0]}"' for col in cur.fetchall()]
-                column_string = ", ".join(columns)
+                col_rows = cur.fetchall()
+                col_names = [col[0] for col in col_rows]
+                all_data_cols = col_names
+
+                non_geom_cols = ", ".join([f'd."{c}"' for c in col_names])
+
+                # ✅ geometry 앞에 reg_date(테이블 등록시간) 삽입
+                geom_part = f', d."{geom_col_name}"' if geom_col_name else ''
 
                 part = (
-                    f"SELECT '{r['id']}'::text as manage_id, "
-                    f"'{r['name']}'::text as project_name, "
-                    f"'{r['gpkg_name']}'::text as source_gpkg, "
-                    f"'{t_name}'::text as source_table, "
-                    f"'{q_type}'::text as qfield_type, {column_string} "
+                    f"SELECT "
+                    f"d.seq AS origin_seq, "
+                    f"'{reg_date_val}'::timestamp AS table_reg_date, "  # 정렬 기준 겸 뷰 노출용
+                    f"'{r['id']}'::text AS manage_id, "
+                    f"'{r['name']}'::text AS project_name, "
+                    f"'{r['gpkg_name']}'::text AS source_gpkg, "
+                    f"'{t_name}'::text AS source_table, "
+                    f"'{q_type}'::text AS qfield_type, "
+                    f"{non_geom_cols}, "                                # 일반 데이터 컬럼
+                    f"'{reg_date_val}'::timestamp AS added_at"          # ✅ geometry 앞 등록시간 컬럼
+                    f"{geom_part} "                                     # ✅ geometry 맨 마지막
                     f"FROM {TARGET_SCHEMA}.\"{t_name}\" d"
                 )
                 view_parts.append(part)
 
             if view_parts:
                 specific_view_name = f"{q_type}_v_qfield_data"
-                # ✅ 기존 뷰를 먼저 제거 후 재생성 — REPLACE가 락 잡는 경우 방어
-                try:
-                    cur.execute(f"DROP VIEW IF EXISTS {TARGET_SCHEMA}.{specific_view_name}")
-                except Exception as drop_err:
-                    print(f"      ⚠️ 뷰 DROP 실패 (무시): {drop_err}")
+                union_sql = " UNION ALL ".join(view_parts)
+
+                outer_cols = ", ".join([f'sub."{c}"' for c in all_data_cols])
+                geom_outer = f', sub."{geom_col_name}"' if geom_col_name else ''
 
                 create_view_sql = (
                     f"CREATE VIEW {TARGET_SCHEMA}.{specific_view_name} AS "
-                    + " UNION ALL ".join(view_parts)
+                    f"SELECT "
+                    f"  ROW_NUMBER() OVER ("
+                    f"    ORDER BY sub.table_reg_date ASC, sub.origin_seq ASC"
+                    f"  ) AS seq, "
+                    f"  sub.manage_id, sub.project_name, sub.source_gpkg, "
+                    f"  sub.source_table, sub.qfield_type, "
+                    f"  {outer_cols}, "                                 # 일반 데이터 컬럼
+                    f"  sub.added_at"                                   # ✅ geometry 앞 등록시간
+                    f"  {geom_outer} "                                  # ✅ geometry 맨 마지막
+                    f"FROM ({union_sql}) sub"
                 )
+
                 try:
+                    cur.execute(f"DROP VIEW IF EXISTS {TARGET_SCHEMA}.{specific_view_name} CASCADE")
                     cur.execute(create_view_sql)
                     print(f"      ✅ 뷰 생성 완료: {TARGET_SCHEMA}.{specific_view_name}")
                 except Exception as view_err:
@@ -497,7 +535,6 @@ def update_unified_view():
     except Exception as e:
         print(f"      ⚠️ 뷰 갱신 오류: {e}")
     finally:
-        # ✅ autocommit 모드라 rollback 불필요, 커넥션만 안전하게 닫기
         try:
             if conn:
                 conn.close()
@@ -681,20 +718,22 @@ def cleanup_deleted_projects(current_project_ids):
 
             for table_name, pid, pname in ghost_list:
                 try:
-                    # 2. 물리 테이블 삭제
-                    cur.execute(f'DROP TABLE IF EXISTS {TARGET_SCHEMA}."{table_name}" CASCADE')
-
-                    # 3. 관리 테이블 삭제
+                    # ✅ DROP 대신 use_yn = 'n' 으로 소프트 삭제
                     cur.execute(
-                        f"DELETE FROM {TARGET_SCHEMA}.qfield_data_manage WHERE id = %s",
-                        (pid,)
+                        f'UPDATE {TARGET_SCHEMA}."{table_name}" SET use_yn = %s',
+                        ('n',)
                     )
-
-                    print(f"    🗑️ 삭제 완료: {pname} ({pid})")
+                    # ✅ qfield_data_manage도 DELETE 대신 상태 컬럼 업데이트 (선택)
+                    # 관리 테이블에도 이력을 남기려면 아래 주석 해제
+                    # cur.execute(
+                    #     f"UPDATE {TARGET_SCHEMA}.qfield_data_manage SET use_yn = 'n' WHERE id = %s",
+                    #     (pid,)
+                    # )
+                    print(f"    🗑️ 소프트 삭제 완료 (use_yn=n): {pname} ({pid})")
                     ghost_found = True
-
                 except Exception as e:
-                    print(f"    ⚠️ 삭제 실패: {table_name} → {e}")
+                    print(f"    ⚠️ 삭제 처리 실패: {table_name} → {e}")
+
 
     except Exception as e:
         print(f"⚠️ 유령 정리 오류: {e}")
