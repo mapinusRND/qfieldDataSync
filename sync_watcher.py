@@ -308,22 +308,17 @@ def save_gdf_direct(gdf, table_name, schema, project_path, owner_name, allowed_c
 def process_gpkg_to_db(project_id, project_path, project_name, owner):
     """
     다운로드된 프로젝트 폴더 내의 모든 .gpkg 파일을 스캔하여 분석 및 적재를 수행합니다.
-    1. 관리 테이블(qfield_data_manage) 생성 및 프로젝트 변환 이력 관리.
-    2. GPKG 내의 각 레이어를 개별 데이터프레임으로 변환.
-    3. 좌표계를 3857로 통일하고 고유 테이블 명칭을 생성하여 save_gdf_direct 호출.
-    4. 분석 결과가 업데이트되면 최종 통합 뷰(VIEW)를 갱신하도록 트리거합니다.
     """
     print(f"    🔍 [분석 시작] {project_name}")
-    short_id = project_id[:13] # 테이블 명칭 길이를 제한하기 위한 ID 슬라이싱
+    short_id = project_id[:13]
     now = datetime.now()
-    clean_owner = owner.lower().replace(' ', '_').replace('-', '_') # DB 명칭 규칙 준수용 치환
+    clean_owner = owner.lower().replace(' ', '_').replace('-', '_')
 
-    # 데이터 분류를 위한 기준 정보 로드
     qfield_info_map = get_qfield_info_column_lists()
     if not qfield_info_map:
         return False
 
-    # 어떤 프로젝트가 어떤 물리 테이블과 매칭되는지 기록하는 통합 관리 테이블
+    # ✅ qfield_data_manage에 use_yn 컬럼 추가 (소프트 삭제 상태 관리용)
     with db_engine.connect() as conn:
         conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS {TARGET_SCHEMA}.qfield_data_manage (
@@ -334,41 +329,42 @@ def process_gpkg_to_db(project_id, project_path, project_name, owner):
                 table_name TEXT,
                 owner TEXT,
                 qfield_type TEXT,
+                use_yn CHAR(1) DEFAULT 'y',
                 reg_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 update_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 CONSTRAINT unique_gpkg_per_project UNIQUE (id, gpkg_name)
             )
+        """))
+        # ✅ 기존 테이블에 use_yn 컬럼이 없을 경우 대비 (ALTER로 안전하게 추가)
+        conn.execute(text(f"""
+            ALTER TABLE {TARGET_SCHEMA}.qfield_data_manage
+            ADD COLUMN IF NOT EXISTS use_yn CHAR(1) DEFAULT 'y'
         """))
         conn.commit()
 
     any_updated, global_table_index = False, 1
     if not os.path.exists(project_path): return False
 
-    # 프로젝트 폴더 내의 모든 GeoPackage 파일 리스트 확보
     files = [f for f in os.listdir(project_path) if f.endswith(".gpkg")]
 
     for file in files:
         gpkg_path = os.path.join(project_path, file)
         file_stem = os.path.splitext(file)[0]
-        
+
         try:
             import fiona
             layers = fiona.listlayers(gpkg_path)
             for layer_name in layers:
-                # QGIS 내부 관리용 시스템 레이어는 데이터 분석에서 제외
                 if layer_name.lower() in ['layer_styles', 'geopackage_contents', 'gpkg_contents']:
                     continue
 
-                # 레이어 읽기 및 빈 데이터 체크
                 gdf = gpd.read_file(gpkg_path, layer=layer_name)
                 if gdf.empty: continue
 
-                # 지리 정보 유무 확인 및 컬럼 목록 추출
                 is_geo = (isinstance(gdf, gpd.GeoDataFrame) and gdf.geometry is not None)
                 geom_col = gdf.geometry.name if is_geo else None
                 gpkg_columns = [c for c in gdf.columns if c != geom_col]
 
-                # 해당 레이어가 우리가 관리하는 '재난 타입'에 해당하는지 판별
                 matched_type, matched_col_list = find_matching_qfield_type(gpkg_columns, qfield_info_map)
 
                 if matched_type is None:
@@ -377,26 +373,24 @@ def process_gpkg_to_db(project_id, project_path, project_name, owner):
 
                 print(f"        ✅ [매칭 성공] type='{matched_type}'")
 
-                # 좌표계 통일: 원본 CRS가 있으면 3857로 변환, 없으면 기본값(5186) 부여 후 변환
                 gdf = gdf.to_crs(epsg=3857) if gdf.crs else gdf.set_crs(epsg=5186).to_crs(epsg=3857)
                 gdf = gdf.assign(owner=owner, reg_date=now, update_at=now)
 
-                # 개별 테이블명 생성 (소유자_ID_순번) 및 DB 전송
                 table_name = f"{clean_owner}_{short_id}_{global_table_index}"
                 save_gdf_direct(gdf, table_name, TARGET_SCHEMA, project_path, owner, allowed_columns=matched_col_list)
 
-                # 관리 테이블에 변환 이력 기록 (이미 있는 파일이면 최신 정보로 UPDATE)
                 with db_engine.connect() as conn:
                     conn.execute(text(f"""
                         INSERT INTO {TARGET_SCHEMA}.qfield_data_manage
-                            (id, name, gpkg_name, table_name, owner, qfield_type, reg_date, update_at)
+                            (id, name, gpkg_name, table_name, owner, qfield_type, use_yn, reg_date, update_at)
                         VALUES
-                            (:pid, :pname, :gname, :tname, :owner, :qtype, :now, :now)
+                            (:pid, :pname, :gname, :tname, :owner, :qtype, 'y', :now, :now)
                         ON CONFLICT (id, gpkg_name) DO UPDATE SET
                             name = EXCLUDED.name,
                             table_name = EXCLUDED.table_name,
                             owner = EXCLUDED.owner,
                             qfield_type = EXCLUDED.qfield_type,
+                            use_yn = 'y',                          -- ✅ 재등록 시 use_yn 복구
                             update_at = EXCLUDED.update_at
                     """), {
                         "pid": project_id, "pname": project_name, "gname": file_stem,
@@ -409,7 +403,6 @@ def process_gpkg_to_db(project_id, project_path, project_name, owner):
         except Exception as e:
             print(f"        ⚠️ {file} 처리 중 에러: {e}")
 
-    # 하나라도 데이터가 갱신되었다면 UNION ALL 기반의 대시보드용 뷰를 다시 생성합니다.
     if any_updated:
         update_unified_view()
 
@@ -687,8 +680,9 @@ def get_all_projects_from_db():
 def cleanup_deleted_projects(current_project_ids):
     """
     QFieldCloud에서 삭제된 프로젝트(유령 데이터)를 DB에서 정리한다.
-    - 물리 테이블 DROP
-    - qfield_data_manage 삭제
+    - use_yn = 'y' 인 활성 프로젝트만 체크 (이미 'n' 처리된 건 반복 감지 방지)
+    - 물리 테이블 use_yn = 'n' 소프트 삭제
+    - qfield_data_manage use_yn = 'n' 업데이트
     - VIEW 재생성
     """
     if not current_project_ids:
@@ -702,14 +696,14 @@ def cleanup_deleted_projects(current_project_ids):
         conn.autocommit = True
         cur = conn.cursor()
 
-        # IN 절 문자열 생성
         id_params_str = str(tuple(current_project_ids)) if len(current_project_ids) > 1 else f"('{current_project_ids[0]}')"
 
-        # 1. 유령 데이터 조회
+        # ✅ use_yn = 'y' 인 활성 프로젝트 중에서만 삭제된 것을 감지
         cur.execute(f"""
             SELECT table_name, id, name 
             FROM {TARGET_SCHEMA}.qfield_data_manage
             WHERE id NOT IN {id_params_str}
+              AND use_yn = 'y'
         """)
         ghost_list = cur.fetchall()
 
@@ -718,22 +712,21 @@ def cleanup_deleted_projects(current_project_ids):
 
             for table_name, pid, pname in ghost_list:
                 try:
-                    # ✅ DROP 대신 use_yn = 'n' 으로 소프트 삭제
+                    # 물리 테이블 소프트 삭제
                     cur.execute(
                         f'UPDATE {TARGET_SCHEMA}."{table_name}" SET use_yn = %s',
                         ('n',)
                     )
-                    # ✅ qfield_data_manage도 DELETE 대신 상태 컬럼 업데이트 (선택)
-                    # 관리 테이블에도 이력을 남기려면 아래 주석 해제
-                    # cur.execute(
-                    #     f"UPDATE {TARGET_SCHEMA}.qfield_data_manage SET use_yn = 'n' WHERE id = %s",
-                    #     (pid,)
-                    # )
+                    # ✅ qfield_data_manage도 use_yn = 'n' 으로 업데이트 (반복 감지 방지 핵심)
+                    cur.execute(
+                        f"UPDATE {TARGET_SCHEMA}.qfield_data_manage SET use_yn = 'n' WHERE id = %s",
+                        (pid,)
+                    )
                     print(f"    🗑️ 소프트 삭제 완료 (use_yn=n): {pname} ({pid})")
                     ghost_found = True
+
                 except Exception as e:
                     print(f"    ⚠️ 삭제 처리 실패: {table_name} → {e}")
-
 
     except Exception as e:
         print(f"⚠️ 유령 정리 오류: {e}")
@@ -742,7 +735,6 @@ def cleanup_deleted_projects(current_project_ids):
         if conn:
             conn.close()
 
-    # 4. VIEW 갱신
     if ghost_found:
         update_unified_view()
 
