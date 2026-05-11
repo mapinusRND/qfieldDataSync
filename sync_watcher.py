@@ -534,6 +534,181 @@ def update_unified_view():
         except Exception:
             pass
 
+def update_total_view():
+    """
+    disaster.qfield_info 테이블을 동적으로 읽어 통합 뷰를 생성합니다.
+    하드코딩 없이 타입별 컬럼 목록을 자동으로 파악하여 UNION ALL 구성합니다.
+    """
+    print(f"    📊 [통합 뷰 생성 시작] qfield.v_total_qfield_data")
+
+    # ================================
+    # try 밖으로 꺼낸 헬퍼 함수
+    # ================================
+    def col_or_null(actual_col, alias, existing_cols):
+        """실제 컬럼이 뷰에 존재하면 참조, 없으면 NULL로 대체"""
+        if actual_col and actual_col in existing_cols:
+            return f'"{actual_col}" AS "{alias}"'
+        return f'NULL AS "{alias}"'
+
+    def parse_column_list(raw_list):
+        """PostgreSQL 배열 형식 또는 문자열을 파이썬 리스트로 파싱"""
+        if isinstance(raw_list, list):
+            return raw_list
+        if isinstance(raw_list, str):
+            cleaned = raw_list.strip()
+            if cleaned.startswith('{') and cleaned.endswith('}'):
+                inner = cleaned[1:-1]
+                return [c.strip().strip('"') for c in inner.split(',') if c.strip()]
+            return [c.strip() for c in cleaned.split(',') if c.strip()]
+        return []
+
+    conn = None
+    try:
+        conn = get_pg_conn()
+        conn.autocommit = True
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+
+        # ================================
+        # 1. disaster.qfield_info에서 타입별 컬럼 목록 로드
+        # ================================
+        cur.execute(f"""
+            SELECT qfield_type, column_list
+            FROM {QFIELD_INFO_SCHEMA}.{QFIELD_INFO_TABLE}
+            ORDER BY id
+        """)
+        qfield_info_rows = cur.fetchall()
+
+        if not qfield_info_rows:
+            print(f"    ⚠️ [통합 뷰 스킵] qfield_info 데이터 없음")
+            return
+
+        # ================================
+        # 2. 타입별 역할명(접두사 제거) 분류
+        # ================================
+        all_role_names = {}
+        type_col_map = {}
+
+        for row in qfield_info_rows:
+            q_type = row['qfield_type']
+            col_list = parse_column_list(row['column_list'])
+            prefix = f"{q_type}_"
+            role_map = {}
+
+            for col in col_list:
+                role = col[len(prefix):] if col.lower().startswith(prefix) else col
+                role_map[role] = col
+                all_role_names[role] = True
+
+            # record_txt: STT 결과 컬럼 (qfield_info에 없지만 뷰에 존재)
+            if 'record' in role_map:
+                role_map['record_txt'] = f"{q_type}_record_txt"
+
+            type_col_map[q_type] = role_map
+            print(f"    📋 [{q_type}] 역할 매핑: {role_map}")
+
+        all_role_names['record_txt'] = True
+
+        # 컬럼 출력 순서 고정
+        ordered_roles = [
+            'facilities_name',
+            'height', 'length', 'breadth', 'diameter',
+            'photo_1', 'photo_2', 'photo_3', 'photo_4', 'photo_5',
+            'record', 'record_txt',
+            'd_date',
+        ]
+        # 위 목록에 없는 나머지 역할명 뒤에 추가 (예: snow의 slope 등)
+        for role in all_role_names:
+            if role not in ordered_roles:
+                ordered_roles.append(role)
+
+        print(f"    📋 [최종 역할 순서] {ordered_roles}")
+
+        # ================================
+        # 3. 타입별 뷰 확인 후 UNION ALL 파트 생성
+        # ================================
+        union_parts = []
+        included_types = []
+
+        for row in qfield_info_rows:
+            q_type = row['qfield_type']
+            view_name = f"{q_type}_v_qfield_data"
+
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.views
+                    WHERE table_schema = %s AND table_name = %s
+                )
+            """, (TARGET_SCHEMA, view_name))
+
+            if not cur.fetchone()[0]:
+                print(f"    ⏭️ [스킵] {view_name} 뷰 없음 (아직 데이터 미수집)")
+                continue
+
+            cur.execute("""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = %s AND table_name = %s
+                ORDER BY ordinal_position
+            """, (TARGET_SCHEMA, view_name))
+            existing_cols = set(r['column_name'] for r in cur.fetchall())
+
+            role_map = type_col_map.get(q_type, {})
+
+            role_selects = []
+            for role in ordered_roles:
+                actual_col = role_map.get(role)
+                role_selects.append(col_or_null(actual_col, role, existing_cols))
+
+            role_select_sql = ",\n    ".join(role_selects)
+
+            geom_select = (
+                '"geometry"'
+                if 'geometry' in existing_cols
+                else 'NULL::geometry AS "geometry"'
+            )
+
+            part = f"""-- {q_type}
+SELECT
+    (qfield_type || '_' || CAST(seq AS VARCHAR)) AS total_seq,
+    seq                                          AS original_seq,
+    manage_id, project_name, source_gpkg, source_table, qfield_type,
+    {col_or_null('platform_type', 'platform_type', existing_cols)},
+    {role_select_sql},
+    {col_or_null('use_yn', 'use_yn', existing_cols)},
+    {col_or_null('added_at', 'added_at', existing_cols)},
+    {geom_select}
+FROM {TARGET_SCHEMA}.{view_name}"""
+
+            union_parts.append(part)
+            included_types.append(q_type)
+            print(f"    ✅ [파트 추가] {view_name}")
+
+        if not union_parts:
+            print(f"    ⚠️ [통합 뷰 스킵] 유효한 타입별 뷰 없음")
+            return
+
+        # ================================
+        # 4. CREATE OR REPLACE VIEW 실행
+        # ================================
+        total_view_sql = (
+            f"CREATE OR REPLACE VIEW {TARGET_SCHEMA}.v_total_qfield_data AS\n"
+            + "\nUNION ALL\n".join(union_parts)
+        )
+
+        cur.execute(total_view_sql)
+
+        # f-string 중첩 이슈 해결: 타입 목록을 변수로 분리
+        types_str = ', '.join(included_types)
+        print(f"    ✅ [통합 뷰 생성 완료] {TARGET_SCHEMA}.v_total_qfield_data "
+              f"({len(union_parts)}개 타입: {types_str})")
+
+    except Exception as e:
+        print(f"    ❌ [통합 뷰 생성 실패] {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        if conn:
+            conn.close()
 
 def sync_single_project(project_data):
     """
@@ -740,7 +915,7 @@ def cleanup_deleted_projects(current_project_ids):
 
 # ========== 메인 실행 루프 (Infinite Loop) ==========
 # 30초 간격으로 무한 반복하며 QFieldCloud의 모든 프로젝트를 감시합니다.
-last_jobs_cache = {} # 메모리 상에서 프로젝트별로 처리 완료된 최신 Job ID를 기억함
+last_jobs_cache = {}
 print(f"[{datetime.now()}] 🚀 실시간 동기화 엔진 가동 중...")
 
 while True:
@@ -749,18 +924,18 @@ while True:
         current_project_ids = [p['id'] for p in current_projects]
         cleanup_deleted_projects(current_project_ids)
 
+        cycle_updated = False  # ✅ 추가 1: 사이클 변경 여부 초기화
+
         for p in current_projects:
             p_id = p['id']
             project_path = os.path.join(BASE_OUTPUT_DIR, p_id)
 
             current_job_id = get_latest_job_id(p_id)
 
-            # ✅ DB에 없는 프로젝트 스킵
             if current_job_id == "PROJECT_NOT_FOUND":
                 print(f"    ⚠️ [스킵] {p['name']} - DB에 없는 프로젝트")
                 continue
 
-            # ✅ 일시적 오류 스킵 (다음 루프 재시도)
             if current_job_id == "JOB_CHECK_ERROR":
                 continue
 
@@ -774,6 +949,11 @@ while True:
                 print(f"[{datetime.now()}] 🔄 변경 감지: {p['name']} (소유자: {p['owner']})")
                 sync_single_project(p)
                 last_jobs_cache[p_id] = current_job_id
+                cycle_updated = True  # ✅ 추가 2: 변경 발생 표시
+
+        # ✅ 추가 3: 전체 프로젝트 순회 완료 후 통합 뷰 갱신
+        if cycle_updated:
+            update_total_view()
 
     except Exception as e:
         print(f"⚠️ 루프 에러: {e}")
