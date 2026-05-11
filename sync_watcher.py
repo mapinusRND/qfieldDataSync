@@ -231,17 +231,27 @@ def save_gdf_direct(gdf, table_name, schema, project_path, owner_name, allowed_c
         col_defs = ['seq SERIAL PRIMARY KEY', 'platform_type SMALLINT DEFAULT 1']
         for col in final_cols:
             col_defs.append(f'"{col}" TEXT')
-        col_defs.append("use_yn CHAR(1) DEFAULT 'y'")          # ✅ geometry 앞에 삽입
+        col_defs.append("use_yn CHAR(1) DEFAULT 'y'")
         if is_geo:
             col_defs.append(f'"{geom_col}" GEOMETRY(Geometry, 3857)')
 
         cur.execute(f'DROP TABLE IF EXISTS {schema}."{table_name}" CASCADE')
         cur.execute(f'CREATE TABLE {schema}."{table_name}" ({", ".join(col_defs)})')
 
+        # ✅ 추가: geometry 컬럼에 GiST 인덱스 생성
+        if is_geo:
+            index_name = f"idx_{table_name}_{geom_col}"
+            cur.execute(f"""
+                CREATE INDEX "{index_name}"
+                ON {schema}."{table_name}"
+                USING GIST ("{geom_col}")
+            """)
+            print(f"        🗂️ [인덱스 생성] {index_name}")
+
         # === 🔥 AUDIO 캐시 생성 (중요) ===
         audio_cache = build_audio_cache(project_path)
 
-        insert_cols = ['platform_type'] + final_cols + ['use_yn']   # ✅ use_yn 추가
+        insert_cols = ['platform_type'] + final_cols + ['use_yn']
         if is_geo:
             insert_cols.append(geom_col)
 
@@ -281,7 +291,7 @@ def save_gdf_direct(gdf, table_name, schema, project_path, owner_name, allowed_c
                     val = row_dict.get(col)
                     values.append(None if pd.isna(val) else val)
 
-            values.append('y')                                       # ✅ use_yn = 'y' (신규 등록)
+            values.append('y')
             if is_geo:
                 geom = row_dict.get(geom_col)
                 values.append(wkb_dumps(geom, hex=True, srid=3857) if geom else None)
