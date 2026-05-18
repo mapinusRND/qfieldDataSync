@@ -551,10 +551,13 @@ def update_total_view():
     """
     print(f"    📊 [통합 뷰 생성 시작] qfield.v_total_qfield_data")
 
+    # ================================
+    # try 밖으로 꺼낸 헬퍼 함수
+    # ================================
     def col_or_null(actual_col, alias, existing_cols):
         """실제 컬럼이 뷰에 존재하면 참조, 없으면 NULL로 대체"""
         if actual_col and actual_col in existing_cols:
-            return f'"v"."{actual_col}" AS "{alias}"'
+            return f'"{actual_col}" AS "{alias}"'
         return f'NULL AS "{alias}"'
 
     def parse_column_list(raw_list):
@@ -669,26 +672,22 @@ def update_total_view():
             role_select_sql = ",\n    ".join(role_selects)
 
             geom_select = (
-                'v."geometry"'
+                '"geometry"'
                 if 'geometry' in existing_cols
                 else 'NULL::geometry AS "geometry"'
             )
 
             part = f"""-- {q_type}
 SELECT
-    (v.qfield_type || '_' || CAST(v.seq AS VARCHAR)) AS total_seq,
-    v.seq                                             AS original_seq,
-    v.manage_id, v.project_name, v.source_gpkg, v.source_table, v.qfield_type,
+    (qfield_type || '_' || CAST(seq AS VARCHAR)) AS total_seq,
+    seq                                          AS original_seq,
+    manage_id, project_name, source_gpkg, source_table, qfield_type,
     {col_or_null('platform_type', 'platform_type', existing_cols)},
     {role_select_sql},
     {col_or_null('use_yn', 'use_yn', existing_cols)},
-    m.owner,
     {col_or_null('added_at', 'added_at', existing_cols)},
     {geom_select}
-FROM {TARGET_SCHEMA}.{view_name} v
-LEFT JOIN {TARGET_SCHEMA}.qfield_data_manage m
-       ON m.id = v.manage_id
-      AND m.gpkg_name = v.source_gpkg"""
+FROM {TARGET_SCHEMA}.{view_name}"""
 
             union_parts.append(part)
             included_types.append(q_type)
@@ -708,6 +707,7 @@ LEFT JOIN {TARGET_SCHEMA}.qfield_data_manage m
 
         cur.execute(total_view_sql)
 
+        # f-string 중첩 이슈 해결: 타입 목록을 변수로 분리
         types_str = ', '.join(included_types)
         print(f"    ✅ [통합 뷰 생성 완료] {TARGET_SCHEMA}.v_total_qfield_data "
               f"({len(union_parts)}개 타입: {types_str})")
