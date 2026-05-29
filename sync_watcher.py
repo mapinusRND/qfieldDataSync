@@ -54,7 +54,7 @@ CHECK_INTERVAL = 30              # 새로운 데이터(Job)가 있는지 체크�
 
 # [기준 정보 테이블] 215 서버의 disaster.qfield_info 테이블:
 # 수집된 데이터가 '화재', '침수' 등 어떤 타입인지 컬럼 구성을 통해 판별하기 위한 딕셔너리형 기준 정보
-QFIELD_INFO_SCHEMA = "disaster"
+QFIELD_INFO_SCHEMA = "qfield"
 QFIELD_INFO_TABLE = "qfield_info"
 
 # 디렉토리 초기화: 데이터를 다운로드할 기본 경로가 없으면 생성합니다.
