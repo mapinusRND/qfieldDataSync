@@ -227,16 +227,10 @@ def save_gdf_direct(gdf, table_name, schema, project_path, owner_name, allowed_c
             if 'record' in c.lower():
                 final_cols.append(c + '_txt')
 
-        # ✅ d_date 컬럼 여부 확인 (대소문자 무관)
-        d_date_cols = set(c for c in final_cols if c.lower().endswith('d_date'))
-
         # === 테이블 생성 ===
         col_defs = ['seq SERIAL PRIMARY KEY', 'platform_type SMALLINT DEFAULT 1']
         for col in final_cols:
-            if col.lower() in {c.lower() for c in d_date_cols}:
-                col_defs.append(f'"{col}" TIMESTAMP')          # ✅ d_date → TIMESTAMP
-            else:
-                col_defs.append(f'"{col}" TEXT')
+            col_defs.append(f'"{col}" TEXT')
         col_defs.append("use_yn CHAR(1) DEFAULT 'y'")
         if is_geo:
             col_defs.append(f'"{geom_col}" GEOMETRY(Geometry, 3857)')
@@ -244,7 +238,7 @@ def save_gdf_direct(gdf, table_name, schema, project_path, owner_name, allowed_c
         cur.execute(f'DROP TABLE IF EXISTS {schema}."{table_name}" CASCADE')
         cur.execute(f'CREATE TABLE {schema}."{table_name}" ({", ".join(col_defs)})')
 
-        # ✅ geometry 컬럼에 GiST 인덱스 생성
+        # ✅ 추가: geometry 컬럼에 GiST 인덱스 생성
         if is_geo:
             index_name = f"idx_{table_name}_{geom_col}"
             cur.execute(f"""
@@ -254,21 +248,16 @@ def save_gdf_direct(gdf, table_name, schema, project_path, owner_name, allowed_c
             """)
             print(f"        🗂️ [인덱스 생성] {index_name}")
 
-        # === AUDIO 캐시 생성 ===
+        # === 🔥 AUDIO 캐시 생성 (중요) ===
         audio_cache = build_audio_cache(project_path)
 
         insert_cols = ['platform_type'] + final_cols + ['use_yn']
         if is_geo:
             insert_cols.append(geom_col)
 
-        placeholders = []
-        for col in insert_cols:
-            if col in d_date_cols:
-                placeholders.append('%s::timestamp')           # ✅ d_date → 캐스팅
-            elif col == geom_col:
-                placeholders.append('%s::geometry')
-            else:
-                placeholders.append('%s')
+        placeholders = ['%s'] * len(insert_cols)
+        if is_geo:
+            placeholders[-1] = '%s::geometry'
 
         sql = f'''
             INSERT INTO {schema}."{table_name}"
@@ -276,7 +265,7 @@ def save_gdf_direct(gdf, table_name, schema, project_path, owner_name, allowed_c
             VALUES ({", ".join(placeholders)})
         '''
 
-        # === batch 데이터 생성 ===
+        # === 🔥 batch 데이터 생성 ===
         batch_data = []
 
         for row in gdf.itertuples(index=False):
@@ -286,22 +275,18 @@ def save_gdf_direct(gdf, table_name, schema, project_path, owner_name, allowed_c
                 if col.endswith('_txt'):
                     origin = col[:-4]
                     file = row_dict.get(origin)
+
                     stt_val = ""
                     if isinstance(file, str) and file.strip():
                         filename = os.path.basename(file)
                         path = audio_cache.get(filename)
+
                         if path and dc:
                             try:
                                 stt_val = dc.read_audio(path)
                             except:
                                 pass
                     values.append(stt_val)
-
-                elif col.lower() in {c.lower() for c in d_date_cols}:
-                    # ✅ d_date: 파싱 후 datetime 또는 None 삽입
-                    val = row_dict.get(col)
-                    values.append(_parse_timestamp(val))
-
                 else:
                     val = row_dict.get(col)
                     values.append(None if pd.isna(val) else val)
@@ -312,7 +297,7 @@ def save_gdf_direct(gdf, table_name, schema, project_path, owner_name, allowed_c
                 values.append(wkb_dumps(geom, hex=True, srid=3857) if geom else None)
             batch_data.append(values)
 
-        # === batch insert ===
+        # === 🔥 핵심: batch insert ===
         execute_batch(cur, sql, batch_data, page_size=1000)
 
         conn.commit()
@@ -938,50 +923,6 @@ def cleanup_deleted_projects(current_project_ids):
     if ghost_found:
         update_unified_view()
 
-def _parse_timestamp(val):
-    """
-    d_date 컬럼 값을 datetime으로 변환합니다.
-    - 이미 datetime이면 그대로 반환
-    - 문자열이면 여러 포맷을 순차 시도
-    - 파싱 불가 또는 None이면 None 반환
-    """
-    if val is None:
-        return None
-    try:
-        if pd.isna(val):
-            return None
-    except (TypeError, ValueError):
-        pass
-
-    if isinstance(val, datetime):
-        return val
-
-    if isinstance(val, str):
-        val = val.strip()
-        if not val:
-            return None
-        # 현장 데이터에서 자주 쓰이는 포맷 순서대로 시도
-        formats = [
-            "%Y-%m-%d %H:%M:%S",
-            "%Y-%m-%dT%H:%M:%S",
-            "%Y-%m-%dT%H:%M:%S.%f",
-            "%Y-%m-%d",
-            "%Y/%m/%d %H:%M:%S",
-            "%Y/%m/%d",
-            "%d/%m/%Y %H:%M:%S",
-            "%d/%m/%Y",
-            "%Y%m%d%H%M%S",
-            "%Y%m%d",
-        ]
-        for fmt in formats:
-            try:
-                return datetime.strptime(val, fmt)
-            except ValueError:
-                continue
-        print(f"        ⚠️ [d_date 파싱 실패] 지원하지 않는 형식: '{val}'")
-        return None
-
-    return None
 # ========== 메인 실행 루프 (Infinite Loop) ==========
 # 30초 간격으로 무한 반복하며 QFieldCloud의 모든 프로젝트를 감시합니다.
 last_jobs_cache = {}
